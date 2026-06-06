@@ -673,9 +673,6 @@ async function handleChatCompletions(req, res) {
       return;
     }
 
-    const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
-    const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
-
     if (stream) {
       // ── 流式响应 ──
       res.writeHead(200, {
@@ -691,14 +688,7 @@ async function handleChatCompletions(req, res) {
 
       try {
         while (true) {
-          // 30s 超时：如果 CC 上游无新数据，自动中断流
-          const result = await Promise.race([
-            reader.read(),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-            ),
-          ]);
-          const { done, value } = result;
+          const { done, value } = await reader.read();
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -776,13 +766,7 @@ async function handleChatCompletions(req, res) {
       };
 
       while (true) {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-          ),
-        ]);
-        const { done, value } = result;
+        const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         processLines();
