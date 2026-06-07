@@ -600,7 +600,10 @@ function sendJSON(res, status, data) {
 function getApiKey(headers) {
   const auth = headers['authorization'] || headers['Authorization'] || '';
   if (!auth.startsWith('Bearer ')) return null;
-  return auth.slice(7);
+  const key = auth.slice(7);
+  // CC API Key 必须以 user_ 开头
+  if (!key.startsWith('user_')) return null;
+  return key;
 }
 
 // ── 流式转发 ────────────────────────────────────────
