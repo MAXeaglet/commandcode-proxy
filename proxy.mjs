@@ -648,10 +648,9 @@ async function handleChatCompletions(req, res) {
 
         res.write(translator.getDoneEvent());
       } catch (e) {
-        // 流中断，尝试发个结束标记
+        // 流中断 → 掐断连接，客户端视为连接断开自动重试
         if (!res.writableEnded) {
-          try { res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`); } catch {}
-          try { res.write('data: [DONE]\n\n'); } catch {}
+          try { res.destroy(); } catch {}
         }
       }
 
@@ -1121,10 +1120,9 @@ async function handleMessages(req, res) {
           res.write(event);
         }
       } catch (e) {
+        // 流中断 → 掐断连接
         if (!res.writableEnded) {
-          try {
-            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message }, input_tokens: 0 })}\n\n`);
-          } catch {}
+          try { res.destroy(); } catch {}
         }
       }
 
