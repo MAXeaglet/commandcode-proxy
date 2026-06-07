@@ -113,6 +113,19 @@ function ensureSession(apiKey) {
   return sessionId;
 }
 
+// 定期清理过期 session，防止 Map 无限增长
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [key, entry] of sessionStore) {
+    if (now >= entry.expiresAt) {
+      sessionStore.delete(key);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
+}, 60 * 60 * 1000); // 每小时
+
 function getSessionId(incomingHeaders, apiKey) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
