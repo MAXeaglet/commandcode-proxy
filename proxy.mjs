@@ -53,6 +53,8 @@ function loadConfig() {
 
 const CFG = loadConfig();
 const CC_VERSION = '0.32.3';
+const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
+const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
 
 // ── 日志 ─────────────────────────────────────────────
 function log(level, msg, data) {
@@ -597,18 +599,8 @@ function sendJSON(res, status, data) {
 
 function getApiKey(headers) {
   const auth = headers['authorization'] || headers['Authorization'] || '';
-  const raw = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  // 如果客户端传的是占位 Key，替换为真实 Key
-  if (raw && CFG.apiKey && isPlaceholderKey(raw)) return CFG.apiKey;
-  return raw;
-}
-
-function isPlaceholderKey(key) {
-  // 识别常见的占位 Key 格式
-  if (key.startsWith('sk-')) return true;
-  if (key === 'cc-proxy' || key === 'test' || key === 'key') return true;
-  if (key.length < 20) return true;  // 真实 CC Key 远长于此
-  return false;
+  if (!auth.startsWith('Bearer ')) return null;
+  return auth.slice(7);
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -648,9 +640,9 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers) || CFG.apiKey;
+  const apiKey = getApiKey(req.headers);
   if (!apiKey) {
-    sendJSON(res, 401, { error: { message: 'Missing API key. Set in Authorization header or config.json', type: 'auth_error' } });
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> header', type: 'auth_error' } });
     return;
   }
 
@@ -689,7 +681,13 @@ async function handleChatCompletions(req, res) {
 
       try {
         while (true) {
-          const { done, value } = await reader.read();
+          const result = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
+            ),
+          ]);
+          const { done, value } = result;
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
@@ -767,7 +765,13 @@ async function handleChatCompletions(req, res) {
       };
 
       while (true) {
-        const { done, value } = await reader.read();
+        const result = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
+          ),
+        ]);
+        const { done, value } = result;
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         processLines();
@@ -967,6 +971,7 @@ async function* createAnthropicSseTranslator(response, model) {
 let inputTokens = 0;
 let outputTokens = 0;
 let cachedInputTokens = 0;
+let cacheWriteTokens = 0;
 let stopReason = null;
 let hasError = false;
   const messageId = `msg_${randomUUID().slice(0, 12)}`;
@@ -1011,7 +1016,13 @@ let hasError = false;
   let buffer = '';
 
   while (true) {
-    const { done, value } = await reader.read();
+    const result = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
+      ),
+    ]);
+    const { done, value } = result;
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
@@ -1070,6 +1081,7 @@ let hasError = false;
             inputTokens = u.inputTokens ?? inputTokens;
             outputTokens = u.outputTokens ?? outputTokens;
             cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
+            cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
           }
           break;
         }
@@ -1092,7 +1104,7 @@ let hasError = false;
     yield `event: message_delta\ndata: ${JSON.stringify({
       type: 'message_delta',
       delta: { stop_reason: stopReason || 'end_turn' },
-      usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, input_tokens: inputTokens },
+      usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || null, input_tokens: inputTokens },
     })}\n\n`;
 
     yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
@@ -1113,9 +1125,9 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers) || CFG.apiKey;
+  const apiKey = getApiKey(req.headers);
   if (!apiKey) {
-    sendAnthropicError(res, 401, 'authentication_error', 'Missing API key');
+    sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> header' } });
     return;
   }
 
@@ -1204,7 +1216,13 @@ async function handleMessages(req, res) {
       };
 
       while (true) {
-        const { done, value } = await reader.read();
+        const result = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
+          ),
+        ]);
+        const { done, value } = result;
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         processLines();
@@ -1223,14 +1241,13 @@ async function handleMessages(req, res) {
 let dynamicModels = null;
 let modelsLastFetch = 0;
 
-async function fetchModels() {
+async function fetchModels(apiKey) {
   const now = Date.now();
   if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
     return dynamicModels;
   }
 
   try {
-    const apiKey = CFG.apiKey;
     if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
     const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
@@ -1264,7 +1281,8 @@ async function fetchModels() {
 }
 
 async function handleModels(req, res) {
-  const models = await fetchModels();
+  const apiKey = getApiKey(req.headers);
+  const models = await fetchModels(apiKey);
   const now = nowUnix();
   sendJSON(res, 200, {
     object: 'list',
@@ -1323,6 +1341,6 @@ server.listen(CFG.port, CFG.host, () => {
     logFile: CFG.logFile || '(console only)',
   });
   if (!CFG.apiKey) {
-    log('warn', 'No API key configured. Set CC_API_KEY env var or apiKey in config.json');
+    log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });
