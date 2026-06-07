@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "description": "Command Code → OpenAI 兼容代理",
+  "license": "MIT",
   "main": "proxy.mjs",
   "scripts": {
     "start": "node proxy.mjs",
