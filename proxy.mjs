@@ -959,16 +959,18 @@ function convertAnthropicToOpenAI(anthropicReq) {
   if (anthropicReq.stop_sequences) openaiReq.stop = anthropicReq.stop_sequences;
   if (anthropicReq.metadata?.user_id) openaiReq.user = anthropicReq.metadata.user_id;
 
-  // 7. Anthropic thinking → reasoning_effort
+  // 7. Anthropic thinking → reasoning_effort（LiteLLM 标准映射）
   if (anthropicReq.thinking) {
     const t = anthropicReq.thinking;
-    if (t.type === 'adaptive') {
-      openaiReq.reasoning_effort = 'high';
+    if (t.type === 'disabled' || t.type === 'none') {
+      // 不发送 reasoning_effort
+    } else if (t.type === 'adaptive') {
+      openaiReq.reasoning_effort = t.effort || 'medium';
     } else if (t.budget_tokens !== undefined) {
-      if (t.budget_tokens < 2000) openaiReq.reasoning_effort = 'low';
-      else if (t.budget_tokens < 8000) openaiReq.reasoning_effort = 'medium';
-      else if (t.budget_tokens < 16000) openaiReq.reasoning_effort = 'high';
-      else openaiReq.reasoning_effort = 'max';
+      if (t.budget_tokens >= 10000) openaiReq.reasoning_effort = 'high';
+      else if (t.budget_tokens >= 5000) openaiReq.reasoning_effort = 'medium';
+      else if (t.budget_tokens >= 2000) openaiReq.reasoning_effort = 'low';
+      else openaiReq.reasoning_effort = 'low'; // <2000 → low
     }
   }
 
