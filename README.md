@@ -334,7 +334,7 @@ Based on analysis of official CLI v0.32.3 traffic:
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Fixed Session** | One session per process, 12h expiry + 1h random jitter |
+| **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
 | **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
 | **CLI Envelope** | config/memory/taste/permissionMode/params/threadId |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |

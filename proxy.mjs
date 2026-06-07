@@ -90,38 +90,40 @@ function log(level, msg, data) {
 }
 
 // ── 会话管理 ───────────────────────────────────────
-// Session 固定 2h 过期 + 30min 随机抖动
-// 同一 session 周期内复用，到期自动换新
+// 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
+// 同一 Key 在同一周期内复用，到期自动换新
 const SESSION_DURATION_MS = 12 * 60 * 60 * 1000;    // 12h
 const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
 
-let currentSession = null;
-let sessionExpiresAt = 0;
+const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
 
-function ensureSession() {
+function ensureSession(apiKey) {
   const now = Date.now();
-  if (now < sessionExpiresAt && currentSession) return currentSession;
+  const entry = sessionStore.get(apiKey);
+
+  if (entry && now < entry.expiresAt) {
+    return entry.sessionId;
+  }
 
   // 过期或第一次：生成新 session
   const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
-  currentSession = randomUUID();
-  sessionExpiresAt = now + SESSION_DURATION_MS + jitter;
-  return currentSession;
+  const sessionId = randomUUID();
+  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
+  log('info', 'Session created', { keyPrefix: apiKey.slice(0, 20) + '...', sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
+  return sessionId;
 }
 
-function getSessionId(incomingHeaders) {
+function getSessionId(incomingHeaders, apiKey) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
-    incomingHeaders['openai-session-id'],
-    incomingHeaders['x-request-id'],
   ];
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
   }
-  // 无客户端 session，走进程级 session 管理
-  return ensureSession();
+  // 按 API Key 分 session
+  return ensureSession(apiKey);
 }
 
 // 每个请求独立 thread ID
@@ -635,7 +637,7 @@ function getApiKey(headers) {
 async function forwardToCC(body, apiKey, incomingHeaders = {}) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders);
+  const sessionId = getSessionId(incomingHeaders, apiKey);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -1385,7 +1387,7 @@ server.listen(CFG.port, CFG.host, () => {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
     models: MODELS.length,
-    session: '2h + 30min jitter',
+    session: '12h + 1h jitter, per API key',
     logFile: CFG.logFile || '(console only)',
   });
   if (!CFG.apiKey) {

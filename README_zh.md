@@ -334,7 +334,7 @@ print(message.content[0].text)
 
 | 机制 | 实现 |
 |------|------|
-| **固定 Session** | 每个进程一个 session，12h 过期 + 1h 随机抖动 |
+| **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
 | **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
 | **CLI 信封格式** | config/memory/taste/permissionMode/params/threadId |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
