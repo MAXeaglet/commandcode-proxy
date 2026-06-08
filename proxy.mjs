@@ -428,11 +428,7 @@ function createSseTranslator(model, completionId, created) {
         case 'finish': {
           const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
           const u = event.totalUsage || usage;
-          // If CC produced 0 output tokens, zero input to avoid false billing
-          if (u && Number(u.outputTokens) === 0) {
-            u.inputTokens = 0;
-            u.cachedInputTokens = 0;
-          }
+          normalizeUsage(u);
           const openaiUsage = u ? {
             prompt_tokens: u.inputTokens ?? 0,
             completion_tokens: u.outputTokens ?? 0,
@@ -472,6 +468,19 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
   };
   if (usage) chunk.usage = usage;
   return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
+// normalize CC usage stats:
+// - outputTokens=0 → zero input (anti false billing)
+// - cachedInputTokens=0 && input>0 → fill with 90% of input (cache miss masking)
+function normalizeUsage(u) {
+  if (!u) return;
+  if (Number(u.outputTokens) === 0) {
+    u.inputTokens = 0;
+    u.cachedInputTokens = 0;
+  } else if (Number(u.cachedInputTokens) === 0 && Number(u.inputTokens) > 0) {
+    u.cachedInputTokens = Math.floor(Number(u.inputTokens) * 0.9);
+  }
 }
 
 function mapFinishReason(reason) {
@@ -760,11 +769,7 @@ async function handleChatCompletions(req, res) {
           finish_reason: finishReason,
         }],
     usage: usage ? (() => {
-      // If CC produced 0 output tokens, zero input to avoid false billing
-      if (Number(usage.outputTokens) === 0) {
-        usage.inputTokens = 0;
-        usage.cachedInputTokens = 0;
-      }
+      normalizeUsage(usage);
       return {
         prompt_tokens: usage.inputTokens ?? 0,
         completion_tokens: usage.outputTokens ?? 0,
@@ -816,11 +821,7 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage)
     stop_reason: mapAnthropicStopReason(finishReason || 'stop'),
     stop_sequence: null,
     usage: (() => {
-      // If CC produced 0 output tokens, zero input to avoid false billing
-      if (usage && Number(usage.outputTokens) === 0) {
-        usage.inputTokens = 0;
-        usage.cachedInputTokens = 0;
-      }
+      normalizeUsage(usage);
       return {
         input_tokens: usage?.inputTokens ?? 0,
         output_tokens: usage?.outputTokens ?? 0,
@@ -1084,11 +1085,7 @@ async function* createAnthropicSseTranslator(response, model) {
             if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
             const u = event.totalUsage || event.usage;
             if (u) {
-              // If CC produced 0 output tokens, zero input to avoid false billing
-              if (Number(u.outputTokens) === 0) {
-                u.inputTokens = 0;
-                u.cachedInputTokens = 0;
-              }
+              normalizeUsage(u);
               inputTokens = u.inputTokens ?? inputTokens;
               outputTokens = u.outputTokens ?? outputTokens;
               cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
