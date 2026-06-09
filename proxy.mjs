@@ -475,7 +475,6 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 // - cachedInputTokens=0 && input>0 → fill with 90% of input (cache miss masking)
 function normalizeUsage(u) {
   if (!u) return;
-  log('debug', 'normalizeUsage input', { keys: Object.keys(u).join(','), outputTokens: u.outputTokens, output_tokens: u.output_tokens, inputTokens: u.inputTokens, cachedInputTokens: u.cachedInputTokens });
   if (Number(u.outputTokens) === 0) {
     u.inputTokens = 0;
     u.cachedInputTokens = 0;
