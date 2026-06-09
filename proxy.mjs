@@ -442,8 +442,15 @@ function createSseTranslator(model, completionId, created) {
         case 'error': {
           const msg = event.error?.message || event.message || 'Unknown error';
           log('warn', 'CC stream error', { message: msg });
-          // 发送错误但不塞进 content 里，以 finish_reason 结束
-          out.push(makeChunk(completionId, created, model, {}, 'stop', null));
+          const u = usage || {};
+          normalizeUsage(u);
+          const openaiUsage = {
+            prompt_tokens: u.inputTokens ?? 0,
+            completion_tokens: u.outputTokens ?? 0,
+            total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
+            prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
+          };
+          out.push(makeChunk(completionId, created, model, {}, 'stop', openaiUsage));
           break;
         }
       }
@@ -477,7 +484,7 @@ function normalizeUsage(u) {
   if (!u) return;
   const ot = Number(u.outputTokens);
   const it = Number(u.inputTokens);
-  if (ot === 0) {
+  if (!ot) {  // 0, null, undefined, NaN → zero input (anti false billing)
     u.inputTokens = 0;
     u.cachedInputTokens = 0;
   } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
@@ -685,6 +692,7 @@ async function handleChatCompletions(req, res) {
           log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
           try { reader.cancel(); } catch {}
           if (!res.writableEnded) {
+            try { res.write(`data: ${JSON.stringify({ error: { message: 'Response timeout - try reducing context length (summarize earlier messages)', type: 'rate_limit_error' } })}\n\n`); } catch {}
             try { res.destroy(); } catch {}
           }
         } else {
@@ -786,7 +794,7 @@ async function handleChatCompletions(req, res) {
     if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
       try { reader?.cancel(); } catch {}
-      sendJSON(res, 429, { error: { message: 'Response timeout', type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+      sendJSON(res, 429, { error: { message: 'Response timeout - try reducing context length (summarize earlier messages)', type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
     } else {
       log('error', 'Upstream error', { message: e.message, stack: e.stack?.split('\n')[1]?.trim() });
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 } });
@@ -1188,6 +1196,7 @@ async function handleMessages(req, res) {
         if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
           if (!res.writableEnded) {
+            try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Response timeout - try reducing context length (summarize earlier messages)' } })}\n\n`); } catch {}
             try { res.destroy(); } catch {}
           }
         } else {
@@ -1264,7 +1273,7 @@ async function handleMessages(req, res) {
     if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
       try { reader?.cancel(); } catch {}
-      sendAnthropicError(res, 429, 'rate_limit_error', 'Response timeout');
+      sendAnthropicError(res, 429, 'rate_limit_error', 'Response timeout - try reducing context length (summarize earlier messages)');
     } else {
       log('error', 'Upstream error', { message: e.message });
       sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`);
