@@ -428,7 +428,7 @@ function createSseTranslator(model, completionId, created) {
         case 'finish': {
           const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
           const u = event.totalUsage || usage || {};
-          normalizeUsage(u, 'openai-sse-finish');
+          normalizeUsage(u);
           const openaiUsage = u ? {
             prompt_tokens: u.inputTokens ?? 0,
             completion_tokens: u.outputTokens ?? 0,
@@ -473,25 +473,15 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 // normalize CC usage stats:
 // - outputTokens=0 → zero input (anti false billing)
 // - cachedInputTokens=0 && input>0 → fill with 90% of input (cache miss masking)
-function normalizeUsage(u, label = '') {
-  if (!u) { console.log('[DIAG] normalizeUsage SKIP: null', label); return; }
+function normalizeUsage(u) {
+  if (!u) return;
   const ot = Number(u.outputTokens);
   const it = Number(u.inputTokens);
-  const ct = Number(u.cachedInputTokens);
-  console.log(`[DIAG] normalizeUsage ${label} | outputTokens=${ot} inputTokens=${it} cachedInputTokens=${ct} keys=${Object.keys(u).join(',')}`);
   if (ot === 0) {
     u.inputTokens = 0;
     u.cachedInputTokens = 0;
-    console.log(`[DIAG] normalizeUsage ${label} -> ZEROED`);
-  } else if (Number.isNaN(ct) || ct === 0) {
-    if (it > 0) {
-      u.cachedInputTokens = Math.floor(it * 0.9);
-      console.log(`[DIAG] normalizeUsage ${label} -> CACHE MASK cached=${u.cachedInputTokens}`);
-    } else {
-      console.log(`[DIAG] normalizeUsage ${label} -> NOOP (inputTokens=${it})`);
-    }
-  } else {
-    console.log(`[DIAG] normalizeUsage ${label} -> NOOP (output>0, cached>0)`);
+  } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
+    u.cachedInputTokens = Math.floor(it * 0.9);
   }
 }
 
@@ -782,7 +772,7 @@ async function handleChatCompletions(req, res) {
         }],
     usage: (() => {
       if (!usage) usage = {};
-      normalizeUsage(usage, 'openai-nonstream');
+      normalizeUsage(usage);
       return {
         prompt_tokens: usage.inputTokens ?? 0,
         completion_tokens: usage.outputTokens ?? 0,
@@ -834,7 +824,7 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage)
     stop_reason: mapAnthropicStopReason(finishReason || 'stop'),
     stop_sequence: null,
     usage: (() => {
-      normalizeUsage(usage || {}, 'anthropic-nonstream');
+      normalizeUsage(usage || {});
       return {
         input_tokens: usage?.inputTokens ?? 0,
         output_tokens: usage?.outputTokens ?? 0,
@@ -1098,7 +1088,7 @@ async function* createAnthropicSseTranslator(response, model) {
             if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
             const u = event.totalUsage || event.usage;
             if (u) {
-              normalizeUsage(u, 'anthropic-sse-finish');
+              normalizeUsage(u);
               inputTokens = u.inputTokens ?? inputTokens;
               outputTokens = u.outputTokens ?? outputTokens;
               cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
