@@ -473,29 +473,15 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 // ── 超时日志：记录完整请求上下文与 CC 响应摘要 ──────────
 function logStreamTimeout(startedAt, model, msgCount, apiKey, reqBody, ccBody, partialResponse) {
   const duration = Date.now() - startedAt;
-  const entry = JSON.stringify({
-    event: 'stream_timeout',
-    ts: new Date().toISOString(),
-    keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
-    model,
-    messages: msgCount,
-    durationMs: duration,
-    clientRequest: reqBody,
-    ccRequestBody: ccBody,
-    ccPartialResponse: partialResponse,
-  });
   log('warn', 'Stream idle timeout', {
     keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
     model,
     messages: msgCount,
     durationMs: duration,
+    reqSize: JSON.stringify(reqBody).length,
+    ccBodySize: JSON.stringify(ccBody).length,
+    partialCCResponse: (partialResponse || '').slice(0, 500),
   });
-  // 全量写入日志文件
-  if (CFG.logFile) {
-    try { appendFileSync(CFG.logFile, entry + '\n', 'utf-8'); } catch {}
-  } else {
-    console.error('[TIMEOUT_DETAIL]', entry);
-  }
 }
 
 // normalize CC usage stats:
