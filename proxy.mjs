@@ -473,13 +473,25 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 // normalize CC usage stats:
 // - outputTokens=0 → zero input (anti false billing)
 // - cachedInputTokens=0 && input>0 → fill with 90% of input (cache miss masking)
-function normalizeUsage(u) {
-  if (!u) return;
-  if (Number(u.outputTokens) === 0) {
+function normalizeUsage(u, label = '') {
+  if (!u) { console.log('[DIAG] normalizeUsage SKIP: null', label); return; }
+  const ot = Number(u.outputTokens);
+  const it = Number(u.inputTokens);
+  const ct = Number(u.cachedInputTokens);
+  console.log(`[DIAG] normalizeUsage ${label} | outputTokens=${ot} inputTokens=${it} cachedInputTokens=${ct} keys=${Object.keys(u).join(',')}`);
+  if (ot === 0) {
     u.inputTokens = 0;
     u.cachedInputTokens = 0;
-  } else if (Number(u.cachedInputTokens) === 0 && Number(u.inputTokens) > 0) {
-    u.cachedInputTokens = Math.floor(Number(u.inputTokens) * 0.9);
+    console.log(`[DIAG] normalizeUsage ${label} -> ZEROED`);
+  } else if (Number.isNaN(ct) || ct === 0) {
+    if (it > 0) {
+      u.cachedInputTokens = Math.floor(it * 0.9);
+      console.log(`[DIAG] normalizeUsage ${label} -> CACHE MASK cached=${u.cachedInputTokens}`);
+    } else {
+      console.log(`[DIAG] normalizeUsage ${label} -> NOOP (inputTokens=${it})`);
+    }
+  } else {
+    console.log(`[DIAG] normalizeUsage ${label} -> NOOP (output>0, cached>0)`);
   }
 }
 
@@ -1085,7 +1097,7 @@ async function* createAnthropicSseTranslator(response, model) {
             if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
             const u = event.totalUsage || event.usage;
             if (u) {
-              normalizeUsage(u);
+          normalizeUsage(u, 'openai-sse-finish');
               inputTokens = u.inputTokens ?? inputTokens;
               outputTokens = u.outputTokens ?? outputTokens;
               cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
