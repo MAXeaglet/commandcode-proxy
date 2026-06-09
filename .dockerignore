@@ -1,0 +1,9 @@
+node_modules/
+.git/
+*.log
+.commandcode/
+.opencode/
+.omo/
+temp/
+README*.md
+AGENTS.md

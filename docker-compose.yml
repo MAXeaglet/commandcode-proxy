@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  proxy:
+    build: .
+    ports:
+      - "${PROXY_PORT:-3050}:3050"
+    environment:
+      PORT: "3050"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

@@ -30,13 +30,16 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ```
 commandcode/
-├── config.json     # 端口 / 日志路径等
-├── LICENSE         # MIT License
-├── package.json    # npm start / npm run dev
-├── proxy.mjs       # 单文件核心代理（~1400 行）
-├── AGENTS.md       # AI 辅助开发指令
-├── README.md       # 英文文档
-└── README_zh.md    # 本文档（中文）
+├── config.json           # 端口 / 日志路径等
+├── LICENSE               # MIT License
+├── package.json          # npm start / npm run dev
+├── proxy.mjs             # 单文件核心代理（~1400 行）
+├── Dockerfile            # 容器构建文件（node:22-alpine）
+├── docker-compose.yml    # 容器编排
+├── .dockerignore         # 构建上下文排除规则
+├── AGENTS.md             # AI 辅助开发指令
+├── README.md             # 英文文档
+└── README_zh.md          # 本文档（中文）
 ```
 
 ## 配置
@@ -391,6 +394,40 @@ CLI 发送图片的格式：
 ```
 
 代理收到 OpenAI `image_url` 格式后自动转为上述 CC 格式透传。
+
+## Docker 部署
+
+### 快速启动 (docker compose)
+
+```bash
+docker compose up -d
+```
+
+代理将在 `http://0.0.0.0:3050` 监听。通过 `PROXY_PORT` 自定义主机端口：
+
+```bash
+PROXY_PORT=13050 docker compose up -d
+```
+
+### 从源码构建
+
+```bash
+docker build -t commandcode-proxy:latest .
+docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+```
+
+### 多架构构建
+
+```bash
+npm run docker:build:multi
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `3050` | 容器内监听端口 |
+| `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 
 ## 免责声明
 
