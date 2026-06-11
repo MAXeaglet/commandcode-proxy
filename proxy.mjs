@@ -442,15 +442,9 @@ function createSseTranslator(model, completionId, created) {
         case 'error': {
           const msg = event.error?.message || event.message || 'Unknown error';
           log('warn', 'CC stream error', { message: msg });
-          const u = usage || {};
-          normalizeUsage(u);
-          const openaiUsage = {
-            prompt_tokens: u.inputTokens ?? 0,
-            completion_tokens: u.outputTokens ?? 0,
-            total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
-            prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
-          };
-          out.push(makeChunk(completionId, created, model, {}, 'stop', openaiUsage));
+          // Don't emit a finish_reason chunk — let the natural stream termination
+          // handle it. Otherwise a subsequent finish(tool_calls) would be ignored
+          // by downstream agent loops that stop at the first finish_reason.
           break;
         }
       }
