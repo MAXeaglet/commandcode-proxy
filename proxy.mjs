@@ -365,6 +365,7 @@ function createSseTranslator(model, completionId, created) {
   let toolCallIndex = 0;
 
   return {
+    lastCcEvent: '',
     /** 解析一行 NDJSON，返回 OpenAI chunk 数组 */
     parseLine(line) {
       const trimmed = line.trim();
@@ -373,6 +374,7 @@ function createSseTranslator(model, completionId, created) {
       let event;
       try { event = JSON.parse(trimmed); } catch { return null; }
       if (!event.type) return null;
+      this.lastCcEvent = event.type;
 
       const out = [];
 
@@ -480,7 +482,6 @@ function normalizeUsage(u) {
   const it = Number(u.inputTokens);
   if (!ot) {  // 0, null, undefined, NaN → zero input (anti false billing)
     u.inputTokens = 0;
-    u.cachedInputTokens = 0;
   } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
     u.cachedInputTokens = Math.floor(it * 0.9);
   }
@@ -636,6 +637,7 @@ async function handleChatCompletions(req, res) {
     }
 
     let reader = null;
+    const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = '';
     if (stream) {
       // ── 流式响应 ──
       res.writeHead(200, {
@@ -659,6 +661,7 @@ async function handleChatCompletions(req, res) {
           ]);
           const { done, value } = result;
           if (done) break;
+          bytesReceived += value.length;
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
@@ -669,6 +672,7 @@ async function handleChatCompletions(req, res) {
             if (events) {
               for (const evt of events) res.write(evt);
             }
+            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
           }
         }
 
@@ -683,7 +687,17 @@ async function handleChatCompletions(req, res) {
         res.write(translator.getDoneEvent());
       } catch (e) {
         if (e.message === 'STREAM_IDLE_TIMEOUT') {
-          log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
+          log('warn', 'Stream idle timeout', {
+            keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
+            path: '/v1/chat/completions',
+            model,
+            streaming: true,
+            timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+            elapsedMs: Date.now() - startTime,
+            id: completionId,
+            bytesReceived,
+            lastCcEvent: lastCcEvent || '(none)',
+          });
           try { reader.cancel(); } catch {}
           if (!res.writableEnded) {
             try { res.write(`data: ${JSON.stringify({ error: { message: 'Response timeout - try reducing context length (summarize earlier messages)', type: 'rate_limit_error' } })}\n\n`); } catch {}
@@ -719,9 +733,10 @@ async function handleChatCompletions(req, res) {
           try {
             const event = JSON.parse(trimmed);
             switch (event.type) {
-              case 'text-delta': fullText += event.text || ''; break;
-              case 'reasoning-delta': reasoningContent += event.text || ''; break;
+              case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
+              case 'reasoning-delta': lastCcEvent = event.type; reasoningContent += event.text || ''; break;
               case 'tool-call':
+                lastCcEvent = event.type;
                 toolCalls = toolCalls || [];
                 toolCalls.push({
                   id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
@@ -733,10 +748,12 @@ async function handleChatCompletions(req, res) {
                 });
                 break;
               case 'finish':
+                lastCcEvent = event.type;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
                 if (event.totalUsage) usage = event.totalUsage;
                 break;
               case 'error':
+                lastCcEvent = event.type;
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
                 break;
             }
@@ -753,6 +770,7 @@ async function handleChatCompletions(req, res) {
         ]);
         const { done, value } = result;
         if (done) break;
+        bytesReceived += value.length;
         buf += decoder.decode(value, { stream: true });
         processLines();
       }
@@ -786,7 +804,18 @@ async function handleChatCompletions(req, res) {
     }
   } catch (e) {
     if (e.message === 'STREAM_IDLE_TIMEOUT') {
-      log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
+      log('warn', 'Stream idle timeout', {
+        keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
+        path: '/v1/chat/completions',
+        model,
+        streaming: false,
+        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS,
+        elapsedMs: Date.now() - startTime,
+        id: completionId,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        partialLen: fullText ? fullText.length : 0,
+      });
       try { reader?.cancel(); } catch {}
       sendJSON(res, 429, { error: { message: 'Response timeout - try reducing context length (summarize earlier messages)', type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
     } else {
@@ -976,7 +1005,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
  * Async generator that reads CC NDJSON response body and yields
  * Anthropic SSE events for streaming.
  */
-async function* createAnthropicSseTranslator(response, model) {
+async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let nextBlockIndex = 0;
   let currentBlockIndex = -1;
   let currentBlockType = null;
@@ -987,7 +1016,6 @@ async function* createAnthropicSseTranslator(response, model) {
   let cacheWriteTokens = 0;
   let stopReason = null;
   let hasError = false;
-  const messageId = `msg_${randomUUID().slice(0, 12)}`;
 
   // Close the current text block if one is active
   function closeTextBlock() {
@@ -1038,6 +1066,7 @@ async function* createAnthropicSseTranslator(response, model) {
       ]);
       const { done, value } = result;
       if (done) break;
+      ctx.bytesReceived += value.length;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
@@ -1048,6 +1077,7 @@ async function* createAnthropicSseTranslator(response, model) {
         let event;
         try { event = JSON.parse(trimmed); } catch { continue; }
         if (!event.type) continue;
+        ctx.lastCcEvent = event.type;
 
         switch (event.type) {
           case 'start': case 'start-step': case 'text-start': case 'reasoning-start':
@@ -1171,6 +1201,7 @@ async function handleMessages(req, res) {
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
+    const startTime = Date.now();
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
@@ -1182,13 +1213,25 @@ async function handleMessages(req, res) {
       });
 
       try {
-        const generator = createAnthropicSseTranslator(ccResponse, model);
+        const ctx = { bytesReceived: 0, lastCcEvent: '' };
+        const messageId = 'msg_' + randomUUID().slice(0, 12);
+        const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           res.write(event);
         }
       } catch (e) {
         if (e.message === 'STREAM_IDLE_TIMEOUT') {
-          log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
+          log('warn', 'Stream idle timeout', {
+            keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
+            path: '/v1/messages',
+            model,
+            streaming: true,
+            timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+            elapsedMs: Date.now() - startTime,
+            id: messageId,
+            bytesReceived: ctx.bytesReceived,
+            lastCcEvent: ctx.lastCcEvent || '(none)',
+          });
           if (!res.writableEnded) {
             try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Response timeout - try reducing context length (summarize earlier messages)' } })}\n\n`); } catch {}
             try { res.destroy(); } catch {}
@@ -1210,6 +1253,8 @@ async function handleMessages(req, res) {
       let finishReason = 'stop';
       let usage = null;
       let toolCalls = null;
+      const messageId = 'msg_' + randomUUID().slice(0, 12);
+      let bytesReceived = 0; let lastCcEvent = '';
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1224,8 +1269,9 @@ async function handleMessages(req, res) {
           try {
             const event = JSON.parse(trimmed);
             switch (event.type) {
-              case 'text-delta': fullText += event.text || ''; break;
+              case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
               case 'tool-call':
+                lastCcEvent = event.type;
                 (toolCalls = toolCalls || []).push({
                   id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
                   type: 'function',
@@ -1236,10 +1282,12 @@ async function handleMessages(req, res) {
                 });
                 break;
               case 'finish':
+                lastCcEvent = event.type;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
                 if (event.totalUsage) usage = event.totalUsage;
                 break;
               case 'error':
+                lastCcEvent = event.type;
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
                 break;
             }
@@ -1256,6 +1304,7 @@ async function handleMessages(req, res) {
         ]);
         const { done, value } = result;
         if (done) break;
+        bytesReceived += value.length;
         buf += decoder.decode(value, { stream: true });
         processLines();
       }
@@ -1265,7 +1314,18 @@ async function handleMessages(req, res) {
     }
   } catch (e) {
     if (e.message === 'STREAM_IDLE_TIMEOUT') {
-      log('warn', 'Stream idle timeout', { keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown' });
+      log('warn', 'Stream idle timeout', {
+        keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
+        path: '/v1/messages',
+        model,
+        streaming: false,
+        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS,
+        elapsedMs: Date.now() - startTime,
+        id: messageId,
+        bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        partialLen: fullText ? fullText.length : 0,
+      });
       try { reader?.cancel(); } catch {}
       sendAnthropicError(res, 429, 'rate_limit_error', 'Response timeout - try reducing context length (summarize earlier messages)');
     } else {
