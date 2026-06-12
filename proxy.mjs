@@ -481,6 +481,10 @@ function normalizeUsage(u) {
   const ot = Number(u.outputTokens);
   const it = Number(u.inputTokens);
   if (!ot) {  // 0, null, undefined, NaN → zero input (anti false billing)
+    log('info', 'normalizeUsage: output=0, zeroing input', {
+      originalInputTokens: u.inputTokens,
+      originalCached: u.cachedInputTokens,
+    });
     u.inputTokens = 0;
   } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
     u.cachedInputTokens = Math.floor(it * 0.9);
