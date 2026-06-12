@@ -449,6 +449,10 @@ function createSseTranslator(model, completionId, created) {
           // by downstream agent loops that stop at the first finish_reason.
           break;
         }
+
+        default:
+          log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
+          break;
       }
 
       return out.length > 0 ? out : null;
@@ -474,18 +478,21 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 }
 
 // normalize CC usage stats:
-// - outputTokens=0 → zero input (anti false billing)
+// - outputTokens=0 → fill cache at 95% (keep input)
 // - cachedInputTokens=0 && input>0 → fill with 90% of input (cache miss masking)
 function normalizeUsage(u) {
   if (!u) return;
   const ot = Number(u.outputTokens);
   const it = Number(u.inputTokens);
-  if (!ot) {  // 0, null, undefined, NaN → zero input (anti false billing)
+  if (!ot) {  // 0, null, undefined, NaN → fill cache, keep input (anti false billing)
     log('info', 'normalizeUsage: output=0, zeroing input', {
       originalInputTokens: u.inputTokens,
       originalCached: u.cachedInputTokens,
     });
-    u.inputTokens = 0;
+    // output=0: keep inputTokens (don't zero), fill cachedInputTokens at 95%
+    if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
+      u.cachedInputTokens = Math.floor(it * 0.95);
+    }
   } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
     u.cachedInputTokens = Math.floor(it * 0.9);
   }
@@ -705,7 +712,7 @@ async function handleChatCompletions(req, res) {
           try { reader.cancel(); } catch {}
           if (!res.writableEnded) {
             try { res.write(`data: ${JSON.stringify({ error: { message: 'Response timeout - try reducing context length (summarize earlier messages)', type: 'rate_limit_error' } })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            if (!res.writableEnded) res.end();
           }
         } else {
           log('error', 'Stream error', { message: e.message });
@@ -759,6 +766,9 @@ async function handleChatCompletions(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+                break;
+              default:
+                log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
                 break;
             }
           } catch {}
@@ -1144,6 +1154,10 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: msg } })}\n\n`;
             break;
           }
+
+          default:
+            log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
+            break;
         }
       }
     }
@@ -1238,7 +1252,7 @@ async function handleMessages(req, res) {
           });
           if (!res.writableEnded) {
             try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Response timeout - try reducing context length (summarize earlier messages)' } })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            if (!res.writableEnded) res.end();
           }
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
@@ -1293,6 +1307,9 @@ async function handleMessages(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
+                break;
+              default:
+                log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
                 break;
             }
           } catch {}
