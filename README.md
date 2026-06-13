@@ -6,7 +6,7 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI v0.32.3 network traffic to accurately replicate the Command Code API request protocol.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | 30s/90s stream timeout
+**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Client disconnect detection with upstream abort | Zero-output error detection | Consecutive timeout threshold (reduce context hint) | Privacy-aware logging | 30s/90s stream idle timeout
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -33,7 +33,7 @@ commandcode/
 ├── config.json         # Port / log path etc.
 ├── LICENSE             # MIT License
 ├── package.json        # npm start / npm run dev
-├── proxy.mjs           # Single-file proxy core (~1400 lines)
+├── proxy.mjs           # Single-file proxy core (~1600 lines)
 ├── Dockerfile          # Container build (node:22-alpine)
 ├── docker-compose.yml  # Container orchestration
 ├── .dockerignore       # Build context exclusions
@@ -244,8 +244,9 @@ Health check. Returns `OK`.
 |-------------|-------------|
 | 400 | Invalid request format |
 | 401 | API Key missing / invalid format / rejected (Key must start with `user_`) |
-| 429 | Rate limited (includes `retry_after` field) |
-| 502 | CC upstream error |
+| 408 | — (用 429，见下) |
+| 429 | Idle timeout (30s streaming / 90s non-streaming, consecutive 3: reduce context hint) |
+| 502 | Zero output tokens (empty response from upstream) or CC upstream error |
 | 503 | Service temporarily unavailable |
 
 ## Model List
@@ -346,6 +347,10 @@ Based on analysis of official CLI v0.32.3 traffic:
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming auto-abort on idle |
+| **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
+| **Zero-Output Guard** | outputTokens=0 → 502 error (anti false billing) |
+| **Upstream Abort** | `AbortController` on client disconnect + all error paths |
+| **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
 
 ## Protocol Details
 

@@ -6,7 +6,7 @@
 
 基于对官方 CLI v0.32.3 网络流量的分析，精确还原了 Command Code API 的请求协议，并实现了多层兼容适配。
 
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 30s/90s 流式超时
+**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 客户端断连检测（上游中止） | 零输出错误检测 | 连续超时阈值（压缩上下文提示） | 隐私保护日志 | 30s/90s 流式超时
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -33,7 +33,7 @@ commandcode/
 ├── config.json           # 端口 / 日志路径等
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1400 行）
+├── proxy.mjs             # 单文件核心代理（~1600 行）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
@@ -244,8 +244,9 @@ data: {"type":"message_stop"}
 |-----------|------|
 | 400 | 请求格式错误 |
 | 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头） |
-| 429 | 速率限制（含 `retry_after` 字段） |
-| 502 | CC 上游错误 |
+| 408 | —（用 429，见下） |
+| 429 | 空闲超时（30s 流式 / 90s 非流式，连续 3 次：提示压缩上下文） |
+| 502 | 零输出 token（上游返回空响应）或 CC 上游错误 |
 | 503 | 服务暂时不可用 |
 
 ## 模型列表
@@ -346,6 +347,10 @@ print(message.content[0].text)
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 正则 `user_[a-zA-Z0-9_-]+`，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s 无新数据自动中断 |
+| **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
+| **零输出防护** | outputTokens=0 → 返回 502 错误（反异常计费） |
+| **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
+| **隐私保护日志** | 日志不含 API Key 片段、错误 body、stack trace |
 
 ## 协议细节
 
