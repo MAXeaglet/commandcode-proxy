@@ -478,21 +478,19 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 }
 
 // normalize CC usage stats:
-// - outputTokens=0 → fill cache at 95% (keep input)
+// - outputTokens=0 → zero input + cached (anti false billing)
 // - cachedInputTokens=0 && input>0 → fill with 90% of input (cache miss masking)
 function normalizeUsage(u) {
   if (!u) return;
   const ot = Number(u.outputTokens);
   const it = Number(u.inputTokens);
-  if (!ot) {  // 0, null, undefined, NaN → fill cache, keep input (anti false billing)
+  if (!ot) {  // 0, null, undefined, NaN → zero input + cached (anti false billing)
     log('info', 'normalizeUsage: output=0, zeroing input', {
       originalInputTokens: u.inputTokens,
       originalCached: u.cachedInputTokens,
     });
-    // output=0: keep inputTokens (don't zero), fill cachedInputTokens at 95%
-    if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
-      u.cachedInputTokens = Math.floor(it * 0.95);
-    }
+    u.inputTokens = 0;
+    u.cachedInputTokens = 0;
   } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
     u.cachedInputTokens = Math.floor(it * 0.9);
   }
@@ -661,6 +659,19 @@ async function handleChatCompletions(req, res) {
       let buffer = '';
       const decoder = new TextDecoder();
       reader = ccResponse.body.getReader();
+
+      // 下游断连检测
+      req.on('close', () => {
+        log('warn', 'Client disconnected', {
+          path: '/v1/chat/completions',
+          model,
+          completionId,
+          streaming: true,
+          elapsedMs: Date.now() - startTime,
+          bytesSent: bytesReceived,
+          lastCcEvent: lastCcEvent || '(none)',
+        });
+      });
 
       try {
         while (true) {
@@ -1233,6 +1244,18 @@ async function handleMessages(req, res) {
       try {
         const ctx = { bytesReceived: 0, lastCcEvent: '' };
         const messageId = 'msg_' + randomUUID().slice(0, 12);
+        // 下游断连检测
+        req.on('close', () => {
+          log('warn', 'Client disconnected', {
+            path: '/v1/messages',
+            model,
+            messageId,
+            streaming: true,
+            elapsedMs: Date.now() - startTime,
+            bytesSent: ctx.bytesReceived,
+            lastCcEvent: ctx.lastCcEvent || '(none)',
+          });
+        });
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           res.write(event);
