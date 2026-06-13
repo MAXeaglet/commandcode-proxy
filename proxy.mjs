@@ -105,7 +105,7 @@ function ensureSession(apiKey) {
   const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
   const sessionId = randomUUID();
   sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
-  log('info', 'Session created', { keyPrefix: apiKey.slice(0, 8) + '...', sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
+      log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
   return sessionId;
 }
 
@@ -466,7 +466,7 @@ function createSseTranslator(model, completionId, created) {
         }
 
         default:
-          log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
+          log('warn', 'Unknown CC event type', { type: event.type });
           break;
       }
 
@@ -500,10 +500,6 @@ function normalizeUsage(u) {
   const ot = Number(u.outputTokens);
   const it = Number(u.inputTokens);
   if (!ot) {  // 0, null, undefined, NaN → zero input + cached (anti false billing)
-    log('info', 'normalizeUsage: output=0, zeroing input', {
-      originalInputTokens: u.inputTokens,
-      originalCached: u.cachedInputTokens,
-    });
     u.inputTokens = 0;
     u.cachedInputTokens = 0;
   } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
@@ -659,7 +655,7 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, body: errorText.slice(0, 200) });
+      log('error', 'CC API error', { status: ccResponse.status });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendJSON(res, mapped.status, mapped.body);
       return;
@@ -765,8 +761,7 @@ async function handleChatCompletions(req, res) {
           try { reader.cancel(); } catch {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
-            keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
-             path: '/v1/chat/completions',
+            path: '/v1/chat/completions',
             model,
             streaming: true,
             timeoutMs: STREAM_IDLE_TIMEOUT_MS,
@@ -843,7 +838,7 @@ async function handleChatCompletions(req, res) {
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
                 break;
               default:
-                log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
+                log('warn', 'Unknown CC event type', { type: event.type });
                 break;
             }
           } catch {}
@@ -908,7 +903,6 @@ async function handleChatCompletions(req, res) {
       });
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
-        keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
         path: '/v1/chat/completions',
         model,
         streaming: false,
@@ -927,7 +921,7 @@ async function handleChatCompletions(req, res) {
         : 'Response timeout - request timed out';
       sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
     } else {
-      log('error', 'Upstream error', { message: e.message, stack: e.stack?.split('\n')[1]?.trim() });
+      log('error', 'Upstream error', { message: e.message });
       abortController.abort(); // 打断 CC 上游
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 } });
     }
@@ -1257,7 +1251,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
           }
 
           default:
-            log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
+            log('warn', 'Unknown CC event type', { type: event.type });
             break;
         }
       }
@@ -1323,7 +1317,7 @@ async function handleMessages(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, body: errorText.slice(0, 200) });
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
@@ -1378,7 +1372,6 @@ async function handleMessages(req, res) {
           // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
-            keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
             path: '/v1/messages',
             model,
             streaming: true,
@@ -1453,7 +1446,7 @@ async function handleMessages(req, res) {
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
                 break;
               default:
-                log('warn', 'Unknown CC event type', { type: event.type, event: JSON.stringify(event).slice(0, 200) });
+                log('warn', 'Unknown CC event type', { type: event.type });
                 break;
             }
           } catch {}
@@ -1494,7 +1487,6 @@ async function handleMessages(req, res) {
       });
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
-        keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
         path: '/v1/messages',
         model,
         streaming: false,
