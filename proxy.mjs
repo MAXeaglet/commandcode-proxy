@@ -595,7 +595,7 @@ function getApiKey(headers) {
 
 // ── 流式转发 ────────────────────────────────────────
 
-async function forwardToCC(body, apiKey, incomingHeaders = {}) {
+async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey);
@@ -614,6 +614,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}) {
       'traceparent': traceparent,
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   return response;
@@ -644,9 +645,13 @@ async function handleChatCompletions(req, res) {
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
 
+  // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
+  const abortController = new AbortController();
+  let aborted = false;
+
   try {
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -657,7 +662,27 @@ async function handleChatCompletions(req, res) {
     }
 
     let reader = null;
+    let translator = null;
     const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = '';
+
+    // 下游断连检测：打断 CC 上游 + 记录日志
+    res.on('close', () => {
+      aborted = true;
+      if (!abortController.signal.aborted) abortController.abort();
+      log('warn', 'Client disconnected', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+        streaming: stream,
+        elapsedMs: Date.now() - startTime,
+        bytesSent: bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        inputTokens: translator?.inputTokens ?? 0,
+        outputTokens: translator?.outputTokens ?? 0,
+        cachedInputTokens: translator?.cachedInputTokens ?? 0,
+      });
+    });
+
     if (stream) {
       // ── 流式响应 ──
       res.writeHead(200, {
@@ -666,26 +691,10 @@ async function handleChatCompletions(req, res) {
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
       });
-      const translator = createSseTranslator(model, completionId, created);
+      translator = createSseTranslator(model, completionId, created);
       let buffer = '';
       const decoder = new TextDecoder();
       reader = ccResponse.body.getReader();
-
-      // 下游断连检测
-      res.on('close', () => {
-        log('warn', 'Client disconnected', {
-          path: '/v1/chat/completions',
-          model,
-          completionId,
-          streaming: true,
-          elapsedMs: Date.now() - startTime,
-          bytesSent: bytesReceived,
-          lastCcEvent: lastCcEvent || '(none)',
-          inputTokens: translator.inputTokens,
-          outputTokens: translator.outputTokens,
-          cachedInputTokens: translator.cachedInputTokens,
-        });
-      });
 
       try {
         while (true) {
@@ -697,6 +706,7 @@ async function handleChatCompletions(req, res) {
           ]);
           const { done, value } = result;
           if (done) break;
+          if (aborted) break;
           bytesReceived += value.length;
 
           buffer += decoder.decode(value, { stream: true });
@@ -712,17 +722,21 @@ async function handleChatCompletions(req, res) {
           }
         }
 
-        // 处理剩余 buffer
-        if (buffer.trim()) {
-          const events = translator.parseLine(buffer);
-          if (events) {
-            for (const evt of events) res.write(evt);
+        if (!aborted) {
+          // 处理剩余 buffer
+          if (buffer.trim()) {
+            const events = translator.parseLine(buffer);
+            if (events) {
+              for (const evt of events) res.write(evt);
+            }
           }
+          res.write(translator.getDoneEvent());
         }
-
-        res.write(translator.getDoneEvent());
       } catch (e) {
-        if (e.message === 'STREAM_IDLE_TIMEOUT') {
+        if (aborted) {
+          // 客户端已断连，只清理
+          try { reader.cancel(); } catch {}
+        } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
              path: '/v1/chat/completions',
@@ -845,7 +859,13 @@ async function handleChatCompletions(req, res) {
       });
     }
   } catch (e) {
-    if (e.message === 'STREAM_IDLE_TIMEOUT') {
+    if (abortController.signal.aborted) {
+      log('warn', 'Request cancelled (client disconnected before CC response)', {
+        path: '/v1/chat/completions',
+        model,
+        completionId,
+      });
+    } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
         keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
         path: '/v1/chat/completions',
@@ -1242,9 +1262,12 @@ async function handleMessages(req, res) {
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
 
+  const abortController = new AbortController();
+  let aborted = false;
+
   try {
     let reader = null;
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -1254,6 +1277,20 @@ async function handleMessages(req, res) {
       return;
     }
     const startTime = Date.now();
+    let messageId = '';
+
+    // 下游断连检测：打断 CC 上游 + 记录日志
+    res.on('close', () => {
+      aborted = true;
+      if (!abortController.signal.aborted) abortController.abort();
+      log('warn', 'Client disconnected', {
+        path: '/v1/messages',
+        model,
+        messageId,
+        streaming: stream,
+        elapsedMs: Date.now() - startTime,
+      });
+    });
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
@@ -1266,28 +1303,16 @@ async function handleMessages(req, res) {
 
       try {
         const ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
-        const messageId = 'msg_' + randomUUID().slice(0, 12);
-        // 下游断连检测
-        res.on('close', () => {
-          log('warn', 'Client disconnected', {
-            path: '/v1/messages',
-            model,
-            messageId,
-            streaming: true,
-            elapsedMs: Date.now() - startTime,
-            bytesSent: ctx.bytesReceived,
-            lastCcEvent: ctx.lastCcEvent || '(none)',
-            inputTokens: ctx.inputTokens,
-            outputTokens: ctx.outputTokens,
-            cachedInputTokens: ctx.cachedInputTokens,
-          });
-        });
+        messageId = 'msg_' + randomUUID().slice(0, 12);
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
+          if (aborted) break;
           res.write(event);
         }
       } catch (e) {
-        if (e.message === 'STREAM_IDLE_TIMEOUT') {
+        if (aborted) {
+          // 客户端已断连，只清理
+        } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
             path: '/v1/messages',
@@ -1386,7 +1411,13 @@ async function handleMessages(req, res) {
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
     }
   } catch (e) {
-    if (e.message === 'STREAM_IDLE_TIMEOUT') {
+    if (abortController.signal.aborted) {
+      log('warn', 'Request cancelled (client disconnected before CC response)', {
+        path: '/v1/messages',
+        model,
+        messageId,
+      });
+    } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
         keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
         path: '/v1/messages',
