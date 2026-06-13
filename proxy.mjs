@@ -661,7 +661,7 @@ async function handleChatCompletions(req, res) {
       reader = ccResponse.body.getReader();
 
       // 下游断连检测
-      req.on('close', () => {
+      res.on('close', () => {
         log('warn', 'Client disconnected', {
           path: '/v1/chat/completions',
           model,
@@ -1245,7 +1245,7 @@ async function handleMessages(req, res) {
         const ctx = { bytesReceived: 0, lastCcEvent: '' };
         const messageId = 'msg_' + randomUUID().slice(0, 12);
         // 下游断连检测
-        req.on('close', () => {
+        res.on('close', () => {
           log('warn', 'Client disconnected', {
             path: '/v1/messages',
             model,
