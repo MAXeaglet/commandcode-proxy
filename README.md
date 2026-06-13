@@ -37,7 +37,6 @@ commandcode/
 ├── Dockerfile          # Container build (node:22-alpine)
 ├── docker-compose.yml  # Container orchestration
 ├── .dockerignore       # Build context exclusions
-├── AGENTS.md           # AI dev instructions
 ├── README.md           # This document (English)
 └── README_zh.md        # Chinese documentation
 ```

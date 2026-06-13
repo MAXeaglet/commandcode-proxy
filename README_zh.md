@@ -37,7 +37,6 @@ commandcode/
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
-├── AGENTS.md             # AI 辅助开发指令
 ├── README.md             # 英文文档
 └── README_zh.md          # 本文档（中文）
 ```

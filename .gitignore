@@ -3,6 +3,7 @@ node_modules/
 *.zip
 .omo/
 .agents/
+AGENTS.md
 stdout.txt
 stderr.txt
 
