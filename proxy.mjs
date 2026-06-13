@@ -781,7 +781,7 @@ async function handleChatCompletions(req, res) {
             : 'Response timeout - request timed out';
           if (!res.writableEnded) {
             try { res.write(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
-            if (!res.writableEnded) res.end();
+            try { res.destroy(); } catch {}
           }
         } else {
           log('error', 'Stream error', { message: e.message });
@@ -1392,7 +1392,7 @@ async function handleMessages(req, res) {
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
             try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
-            if (!res.writableEnded) res.end();
+            try { res.destroy(); } catch {}
           }
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
