@@ -1150,11 +1150,17 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
               outputTokens = u.outputTokens ?? outputTokens;
               cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
               cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
+              ctx.inputTokens = inputTokens;
+              ctx.outputTokens = outputTokens;
+              ctx.cachedInputTokens = cachedInputTokens;
             } else {
               inputTokens = 0;
               outputTokens = 0;
               cachedInputTokens = 0;
               cacheWriteTokens = 0;
+              ctx.inputTokens = 0;
+              ctx.outputTokens = 0;
+              ctx.cachedInputTokens = 0;
             }
             break;
           }
@@ -1242,7 +1248,7 @@ async function handleMessages(req, res) {
       });
 
       try {
-        const ctx = { bytesReceived: 0, lastCcEvent: '' };
+        const ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
         const messageId = 'msg_' + randomUUID().slice(0, 12);
         // 下游断连检测
         res.on('close', () => {
@@ -1254,6 +1260,9 @@ async function handleMessages(req, res) {
             elapsedMs: Date.now() - startTime,
             bytesSent: ctx.bytesReceived,
             lastCcEvent: ctx.lastCcEvent || '(none)',
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+            cachedInputTokens: ctx.cachedInputTokens,
           });
         });
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
@@ -1272,6 +1281,9 @@ async function handleMessages(req, res) {
             id: messageId,
             bytesReceived: ctx.bytesReceived,
             lastCcEvent: ctx.lastCcEvent || '(none)',
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+            cachedInputTokens: ctx.cachedInputTokens,
           });
           if (!res.writableEnded) {
             try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Response timeout - try reducing context length (summarize earlier messages)' } })}\n\n`); } catch {}
