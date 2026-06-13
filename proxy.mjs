@@ -72,6 +72,10 @@ const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
 const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
 const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
 
+// 连续超时计数：连续 3 次超时才提醒压缩上下文，任意成功请求后重置
+let consecutiveTimeouts = 0;
+const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
+
 // ── 日志 ─────────────────────────────────────────────
 function log(level, msg, data) {
   const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
@@ -738,6 +742,8 @@ async function handleChatCompletions(req, res) {
         }
 
         if (!aborted) {
+          // 成功完成一次请求，重置连续超时计数
+          consecutiveTimeouts = 0;
           // 处理剩余 buffer
           if (buffer.trim()) {
             const events = translator.parseLine(buffer);
@@ -745,11 +751,17 @@ async function handleChatCompletions(req, res) {
               for (const evt of events) res.write(evt);
             }
           }
-          res.write(translator.getDoneEvent());
+          // 输出 token 为 0 时记为错误，避免下游异常计费
+          if (translator.outputTokens === 0) {
+            if (!abortController.signal.aborted) abortController.abort();
+            try { res.write(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'proxy_error' } })}\n\n`); } catch {}
+          } else {
+            res.write(translator.getDoneEvent());
+          }
         }
       } catch (e) {
         if (aborted) {
-          // 客户端已断连，只清理
+          // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
           try { reader.cancel(); } catch {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
@@ -767,12 +779,18 @@ async function handleChatCompletions(req, res) {
             cachedInputTokens: translator.cachedInputTokens,
           });
           try { reader.cancel(); } catch {}
+          abortController.abort(); // 打断 CC 上游，避免浪费 token
+          consecutiveTimeouts++;
+          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+            ? 'Response timeout - try reducing context length (summarize earlier messages)'
+            : 'Response timeout - request timed out';
           if (!res.writableEnded) {
-            try { res.write(`data: ${JSON.stringify({ error: { message: 'Response timeout - try reducing context length (summarize earlier messages)', type: 'rate_limit_error' } })}\n\n`); } catch {}
+            try { res.write(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' } })}\n\n`); } catch {}
             if (!res.writableEnded) res.end();
           }
         } else {
           log('error', 'Stream error', { message: e.message });
+          abortController.abort(); // 打断 CC 上游
           if (!res.writableEnded) {
             try { res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'proxy_error' } })}\n\n`); } catch {}
           }
@@ -847,6 +865,14 @@ async function handleChatCompletions(req, res) {
       }
       processLines();
 
+      // 输出 token 为 0 时记为错误，避免下游异常计费
+      if ((usage?.outputTokens ?? 0) === 0) {
+        if (!abortController.signal.aborted) abortController.abort();
+        sendJSON(res, 502, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'proxy_error', input_tokens: 0 } });
+        return;
+      }
+
+      consecutiveTimeouts = 0;
       sendJSON(res, 200, {
         id: completionId,
         object: 'chat.completion',
@@ -894,9 +920,15 @@ async function handleChatCompletions(req, res) {
         partialLen: fullText ? fullText.length : 0,
       });
       try { reader?.cancel(); } catch {}
-      sendJSON(res, 429, { error: { message: 'Response timeout - try reducing context length (summarize earlier messages)', type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+      abortController.abort(); // 打断 CC 上游
+      consecutiveTimeouts++;
+      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+        ? 'Response timeout - try reducing context length (summarize earlier messages)'
+        : 'Response timeout - request timed out';
+      sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
     } else {
       log('error', 'Upstream error', { message: e.message, stack: e.stack?.split('\n')[1]?.trim() });
+      abortController.abort(); // 打断 CC 上游
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 } });
     }
   }
@@ -1236,13 +1268,18 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       const closeBlock = closeTextBlock();
       if (closeBlock) yield closeBlock;
 
-      yield `event: message_delta\ndata: ${JSON.stringify({
-        type: 'message_delta',
-        delta: { stop_reason: stopReason || 'end_turn' },
-        usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || null, input_tokens: inputTokens },
-      })}\n\n`;
+      // 输出 token 为 0 时记为错误，避免下游异常计费
+      if (outputTokens === 0) {
+        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: 'Empty response from upstream (zero output tokens)' } })}\n\n`;
+      } else {
+        yield `event: message_delta\ndata: ${JSON.stringify({
+          type: 'message_delta',
+          delta: { stop_reason: stopReason || 'end_turn' },
+          usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || null, input_tokens: inputTokens },
+        })}\n\n`;
 
-      yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
+        yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
+      }
     }
   } finally {
     // 确保流中断时通知上游
@@ -1338,7 +1375,7 @@ async function handleMessages(req, res) {
         }
       } catch (e) {
         if (aborted) {
-          // 客户端已断连，只清理
+          // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
@@ -1354,12 +1391,18 @@ async function handleMessages(req, res) {
             outputTokens: ctx.outputTokens,
             cachedInputTokens: ctx.cachedInputTokens,
           });
+          abortController.abort(); // 打断 CC 上游
           if (!res.writableEnded) {
-            try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Response timeout - try reducing context length (summarize earlier messages)' } })}\n\n`); } catch {}
+            consecutiveTimeouts++;
+            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+              ? 'Response timeout - try reducing context length (summarize earlier messages)'
+              : 'Response timeout - request timed out';
+            try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg } })}\n\n`); } catch {}
             if (!res.writableEnded) res.end();
           }
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
+          abortController.abort(); // 打断 CC 上游
           if (!res.writableEnded) {
             try {
               res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message } })}\n\n`);
@@ -1368,13 +1411,10 @@ async function handleMessages(req, res) {
         }
       }
 
+      if (!aborted) consecutiveTimeouts = 0;
       if (!res.writableEnded) res.end();
     } else {
       // ── 非流式 Anthropic JSON ──
-      let fullText = '';
-      let finishReason = 'stop';
-      let usage = null;
-      let toolCalls = null;
       const messageId = 'msg_' + randomUUID().slice(0, 12);
       let bytesReceived = 0; let lastCcEvent = '';
 
@@ -1435,6 +1475,14 @@ async function handleMessages(req, res) {
       }
       processLines();
 
+      // 输出 token 为 0 时记为错误，避免下游异常计费
+      if ((usage?.outputTokens ?? 0) === 0) {
+        if (!abortController.signal.aborted) abortController.abort();
+        sendAnthropicError(res, 502, 'proxy_error', 'Empty response from upstream (zero output tokens)');
+        return;
+      }
+
+      consecutiveTimeouts = 0;
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
     }
   } catch (e) {
@@ -1458,9 +1506,15 @@ async function handleMessages(req, res) {
         partialLen: fullText ? fullText.length : 0,
       });
       try { reader?.cancel(); } catch {}
-      sendAnthropicError(res, 429, 'rate_limit_error', 'Response timeout - try reducing context length (summarize earlier messages)');
+      abortController.abort(); // 打断 CC 上游
+      consecutiveTimeouts++;
+      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+        ? 'Response timeout - try reducing context length (summarize earlier messages)'
+        : 'Response timeout - request timed out';
+      sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
     } else {
       log('error', 'Upstream error', { message: e.message });
+      abortController.abort(); // 打断 CC 上游
       sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`);
     }
   }
