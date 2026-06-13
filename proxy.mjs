@@ -667,6 +667,7 @@ async function handleChatCompletions(req, res) {
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
+      if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
       if (!abortController.signal.aborted) {
         // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
@@ -1295,6 +1296,7 @@ async function handleMessages(req, res) {
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
+      if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
       if (!abortController.signal.aborted) {
         // 断连前抢发 usage=0 终止事件，避免下游自行估算 token
