@@ -6,7 +6,7 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI v0.32.3 network traffic to accurately replicate the Command Code API request protocol.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Client disconnect detection with upstream abort | Zero-output error detection | Consecutive timeout threshold (reduce context hint) | Privacy-aware logging | 30s/90s stream idle timeout
+**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Client disconnect detection with upstream abort | Zero-output → 502 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -243,9 +243,8 @@ Health check. Returns `OK`.
 |-------------|-------------|
 | 400 | Invalid request format |
 | 401 | API Key missing / invalid format / rejected (Key must start with `user_`) |
-| 408 | — (用 429，见下) |
-| 429 | Idle timeout (30s streaming / 90s non-streaming, consecutive 3: reduce context hint) |
-| 502 | Zero output tokens (empty response from upstream) or CC upstream error |
+| 429 | Stream idle timeout (30s streaming / 90s non-streaming, SDK auto-retry, consecutive 3: reduce context hint) |
+| 502 | Zero output tokens or CC upstream error |
 | 503 | Service temporarily unavailable |
 
 ## Model List
@@ -345,9 +344,9 @@ Based on analysis of official CLI v0.32.3 traffic:
 | **Project Slug** | Custom `x-project-slug` |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
-| **Stream Timeout** | 30s streaming / 90s non-streaming auto-abort on idle |
+| **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
-| **Zero-Output Guard** | outputTokens=0 → 502 error (anti false billing) |
+| **Zero-Output Guard** | outputTokens=0 → 502 error (SDK auto-retry, anti false billing) |
 | **Upstream Abort** | `AbortController` on client disconnect + all error paths |
 | **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
 

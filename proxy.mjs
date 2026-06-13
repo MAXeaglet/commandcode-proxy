@@ -700,14 +700,9 @@ async function handleChatCompletions(req, res) {
 
     if (stream) {
       // ── 流式响应 ──
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      });
       translator = createSseTranslator(model, completionId, created);
       let buffer = '';
+      let started = false; // 延迟写 200 header，超时/output=0 时返回 JSON 429/502 让 SDK 自动重试
       const decoder = new TextDecoder();
       reader = ccResponse.body.getReader();
 
@@ -731,6 +726,15 @@ async function handleChatCompletions(req, res) {
           for (const line of lines) {
             const events = translator.parseLine(line);
             if (events) {
+              if (!started) {
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive',
+                  'X-Accel-Buffering': 'no',
+                });
+                started = true;
+              }
               for (const evt of events) res.write(evt);
             }
             if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
@@ -744,14 +748,28 @@ async function handleChatCompletions(req, res) {
           if (buffer.trim()) {
             const events = translator.parseLine(buffer);
             if (events) {
+              if (!started) started = true;
               for (const evt of events) res.write(evt);
             }
           }
           // 输出 token 为 0 时记为错误，避免下游异常计费
           if (translator.outputTokens === 0) {
             if (!abortController.signal.aborted) abortController.abort();
+            if (!started) {
+              sendJSON(res, 502, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'proxy_error', input_tokens: 0 } });
+              return;
+            }
             try { res.write(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'proxy_error' } })}\n\n`); } catch {}
           } else {
+            if (!started) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+              });
+              started = true;
+            }
             res.write(translator.getDoneEvent());
           }
         }
@@ -779,6 +797,10 @@ async function handleChatCompletions(req, res) {
           const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
             ? 'Response timeout - try reducing context length (summarize earlier messages)'
             : 'Response timeout - request timed out';
+          if (!started) {
+            sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+            return;
+          }
           if (!res.writableEnded) {
             try { res.write(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
             try { res.destroy(); } catch {}
@@ -786,6 +808,10 @@ async function handleChatCompletions(req, res) {
         } else {
           log('error', 'Stream error', { message: e.message });
           abortController.abort(); // 打断 CC 上游
+          if (!started) {
+            sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 } });
+            return;
+          }
           if (!res.writableEnded) {
             try { res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'proxy_error' } })}\n\n`); } catch {}
           }
@@ -1353,20 +1379,58 @@ async function handleMessages(req, res) {
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      });
+      let started = false; // 延迟写 200 header，超时/output=0 时返回 JSON 429/502 让 SDK 自动重试
+      const buf = [];
 
+      let ctx;
       try {
-        const ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
         messageId = 'msg_' + randomUUID().slice(0, 12);
+        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
-          res.write(event);
+          if (!started) {
+            buf.push(event);
+            // 确认有真实内容后才发 200 header
+            if (event.includes('"text_delta"') || event.includes('"tool_use"')) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+              });
+              started = true;
+              for (const ev of buf) res.write(ev);
+              buf.length = 0;
+            }
+          } else {
+            res.write(event);
+          }
+        }
+
+        if (!aborted) {
+          consecutiveTimeouts = 0;
+          if (ctx.outputTokens === 0) {
+            abortController.abort();
+            if (!started) {
+              sendAnthropicError(res, 502, 'proxy_error', 'Empty response from upstream (zero output tokens)');
+              return;
+            }
+            for (const ev of buf) { try { res.write(ev); } catch {} }
+            buf.length = 0;
+          } else {
+            if (!started) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+              });
+              started = true;
+            }
+            for (const ev of buf) res.write(ev);
+            buf.length = 0;
+          }
         }
       } catch (e) {
         if (aborted) {
@@ -1386,6 +1450,14 @@ async function handleMessages(req, res) {
             cachedInputTokens: ctx.cachedInputTokens,
           });
           abortController.abort(); // 打断 CC 上游
+          if (!started) {
+            consecutiveTimeouts++;
+            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+              ? 'Response timeout - try reducing context length (summarize earlier messages)'
+              : 'Response timeout - request timed out';
+            sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
+            return;
+          }
           if (!res.writableEnded) {
             consecutiveTimeouts++;
             const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -1397,6 +1469,10 @@ async function handleMessages(req, res) {
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
           abortController.abort(); // 打断 CC 上游
+          if (!started) {
+            sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`);
+            return;
+          }
           if (!res.writableEnded) {
             try {
               res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message } })}\n\n`);
@@ -1405,7 +1481,6 @@ async function handleMessages(req, res) {
         }
       }
 
-      if (!aborted) consecutiveTimeouts = 0;
       if (!res.writableEnded) res.end();
     } else {
       // ── 非流式 Anthropic JSON ──
