@@ -366,6 +366,9 @@ function createSseTranslator(model, completionId, created) {
 
   return {
     lastCcEvent: '',
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
     /** 解析一行 NDJSON，返回 OpenAI chunk 数组 */
     parseLine(line) {
       const trimmed = line.trim();
@@ -423,7 +426,12 @@ function createSseTranslator(model, completionId, created) {
 
         case 'finish-step': {
           if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
-          if (event.usage) usage = event.usage;
+          if (event.usage) {
+            usage = event.usage;
+            this.inputTokens = event.usage.inputTokens ?? 0;
+            this.outputTokens = event.usage.outputTokens ?? 0;
+            this.cachedInputTokens = event.usage.cachedInputTokens ?? 0;
+          }
           break;
         }
 
@@ -431,6 +439,9 @@ function createSseTranslator(model, completionId, created) {
           const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
           const u = event.totalUsage || usage || {};
           normalizeUsage(u);
+          this.inputTokens = u.inputTokens ?? 0;
+          this.outputTokens = u.outputTokens ?? 0;
+          this.cachedInputTokens = u.cachedInputTokens ?? 0;
           const openaiUsage = u ? {
             prompt_tokens: u.inputTokens ?? 0,
             completion_tokens: u.outputTokens ?? 0,
@@ -670,6 +681,9 @@ async function handleChatCompletions(req, res) {
           elapsedMs: Date.now() - startTime,
           bytesSent: bytesReceived,
           lastCcEvent: lastCcEvent || '(none)',
+          inputTokens: translator.inputTokens,
+          outputTokens: translator.outputTokens,
+          cachedInputTokens: translator.cachedInputTokens,
         });
       });
 
@@ -711,7 +725,7 @@ async function handleChatCompletions(req, res) {
         if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             keyPrefix: apiKey ? apiKey.slice(0, 8) + '...' : 'unknown',
-            path: '/v1/chat/completions',
+             path: '/v1/chat/completions',
             model,
             streaming: true,
             timeoutMs: STREAM_IDLE_TIMEOUT_MS,
@@ -719,6 +733,9 @@ async function handleChatCompletions(req, res) {
             id: completionId,
             bytesReceived,
             lastCcEvent: lastCcEvent || '(none)',
+            inputTokens: translator.inputTokens,
+            outputTokens: translator.outputTokens,
+            cachedInputTokens: translator.cachedInputTokens,
           });
           try { reader.cancel(); } catch {}
           if (!res.writableEnded) {
