@@ -2,6 +2,7 @@ node_modules/
 *.log
 *.zip
 .omo/
+.agents/
 stdout.txt
 stderr.txt
 
