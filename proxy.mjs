@@ -668,7 +668,21 @@ async function handleChatCompletions(req, res) {
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
       aborted = true;
-      if (!abortController.signal.aborted) abortController.abort();
+      if (!abortController.signal.aborted) {
+        // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
+        try {
+          res.write(`data: ${JSON.stringify({
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+        } catch {}
+        abortController.abort();
+      }
       log('warn', 'Client disconnected', {
         path: '/v1/chat/completions',
         model,
@@ -1282,7 +1296,18 @@ async function handleMessages(req, res) {
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
       aborted = true;
-      if (!abortController.signal.aborted) abortController.abort();
+      if (!abortController.signal.aborted) {
+        // 断连前抢发 usage=0 终止事件，避免下游自行估算 token
+        try {
+          res.write(`event: message_delta\ndata: ${JSON.stringify({
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+            usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
+          })}\n\n`);
+          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+        } catch {}
+        abortController.abort();
+      }
       log('warn', 'Client disconnected', {
         path: '/v1/messages',
         model,
