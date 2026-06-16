@@ -465,6 +465,9 @@ function createSseTranslator(model, completionId, created) {
           break;
         }
 
+        case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+          // Silent - no user-visible content
+          break;
         default:
           log('warn', 'Unknown CC event type', { type: event.type });
           break;
@@ -862,6 +865,9 @@ async function handleChatCompletions(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+                break;
+              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+                // Silent - no user-visible content
                 break;
               default:
                 log('warn', 'Unknown CC event type', { type: event.type });
@@ -1277,6 +1283,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             break;
           }
 
+          case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+            // Silent - no user-visible content
+            break;
           default:
             log('warn', 'Unknown CC event type', { type: event.type });
             break;
@@ -1520,6 +1529,9 @@ async function handleMessages(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
+                break;
+              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+                // Silent - no user-visible content
                 break;
               default:
                 log('warn', 'Unknown CC event type', { type: event.type });
