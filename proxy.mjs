@@ -812,7 +812,7 @@ async function handleChatCompletions(req, res) {
           log('error', 'Stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
-            sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 } });
+            sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
             return;
           }
           if (!res.writableEnded) {
@@ -956,7 +956,7 @@ async function handleChatCompletions(req, res) {
     } else {
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
-      sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 } });
+      sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
     }
   }
 }
@@ -1481,7 +1481,7 @@ async function handleMessages(req, res) {
           log('error', 'Anthropic stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
-            sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`);
+            sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
             return;
           }
           if (!res.writableEnded) {
@@ -1598,7 +1598,7 @@ async function handleMessages(req, res) {
     } else {
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
-      sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`);
+      sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
     }
   }
 }
