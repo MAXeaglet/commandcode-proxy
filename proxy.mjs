@@ -305,8 +305,8 @@ function buildCcRequest(openaiReq) {
       gitStatus: '',
       recentCommits: [],
     },
-    memory: '',
-    taste: '',
+    memory: null,
+    taste: null,
     skills: '',
     permissionMode: 'standard',
     params: {
@@ -315,7 +315,6 @@ function buildCcRequest(openaiReq) {
       max_tokens: Math.min(max_tokens || 64000, 200000),
       stream: true,  // CC API 总是 stream
     },
-    threadId,
   };
 
   // 条件字段
@@ -496,17 +495,13 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 }
 
 // normalize CC usage stats:
-// - outputTokens=0 → zero input + cached (anti false billing)
-// - cachedInputTokens=0 && input>0 → fill with 90% of input (cache miss masking)
+// - outputTokens=0 → zero everything (anti false billing)
 function normalizeUsage(u) {
   if (!u) return;
   const ot = Number(u.outputTokens);
-  const it = Number(u.inputTokens);
   if (!ot) {  // 0, null, undefined, NaN → zero input + cached (anti false billing)
     u.inputTokens = 0;
     u.cachedInputTokens = 0;
-  } else if ((Number.isNaN(Number(u.cachedInputTokens)) || Number(u.cachedInputTokens) === 0) && it > 0) {
-    u.cachedInputTokens = Math.floor(it * 0.9);
   }
 }
 
