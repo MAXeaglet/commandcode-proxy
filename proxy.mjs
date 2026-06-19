@@ -754,10 +754,10 @@ async function handleChatCompletions(req, res) {
           if (translator.outputTokens === 0) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
-              sendJSON(res, 502, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+              sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
               return;
             }
-            try { res.write(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'proxy_error' }, retry_after: 10 })}\n\n`); } catch {}
+            try { res.write(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`); } catch {}
           } else {
             if (!started) {
               res.writeHead(200, {
@@ -890,7 +890,7 @@ async function handleChatCompletions(req, res) {
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-        sendJSON(res, 502, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+        sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
         return;
       }
 
@@ -1295,7 +1295,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if (outputTokens === 0) {
-        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
+        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
       } else {
         yield `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
@@ -1419,7 +1419,7 @@ async function handleMessages(req, res) {
           if (ctx.outputTokens === 0) {
             try { abortController.abort(); } catch {}
             if (!started) {
-              sendAnthropicError(res, 502, 'proxy_error', 'Empty response from upstream (zero output tokens)', 10);
+              sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
               return;
             }
             for (const ev of buf) { try { res.write(ev); } catch {} }
@@ -1556,7 +1556,7 @@ async function handleMessages(req, res) {
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-        sendAnthropicError(res, 502, 'proxy_error', 'Empty response from upstream (zero output tokens)', 10);
+        sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
         return;
       }
 
