@@ -578,7 +578,11 @@ function readBody(req) {
 }
 
 function sendJSON(res, status, data) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  const headers = { 'Content-Type': 'application/json' };
+  if (data && data.retry_after !== undefined) {
+    headers['Retry-After'] = String(data.retry_after);
+  }
+  res.writeHead(status, headers);
   res.end(JSON.stringify(data));
 }
 
@@ -1314,8 +1318,12 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
 function sendAnthropicError(res, status, type, message, retryAfter) {
   const body = { type: 'error', error: { type, message } };
-  if (retryAfter !== undefined) body.retry_after = retryAfter;
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  const headers = { 'Content-Type': 'application/json' };
+  if (retryAfter !== undefined) {
+    body.retry_after = retryAfter;
+    headers['Retry-After'] = String(retryAfter);
+  }
+  res.writeHead(status, headers);
   res.end(JSON.stringify(body));
 }
 
