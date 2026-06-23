@@ -48,18 +48,24 @@ function loadConfig() {
 const CFG = loadConfig();
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
-const FINGERPRINT_PLATFORMS = [
-  { platform: 'win32', arch: 'x64', release: ['10.0.19045', '10.0.22621', '10.0.22631', '10.0.26100'] },
-  { platform: 'darwin', arch: 'arm64', release: ['23.0.0', '23.1.0', '23.2.0', '24.0.0', '24.1.0'] },
-  { platform: 'linux', arch: 'x64', release: ['5.15.0', '6.1.0', '6.5.0', '6.6.0', '6.8.0'] },
-];
+// CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
-  '12th Gen Intel(R) Core(TM) i7-12650H', '13th Gen Intel(R) Core(TM) i7-13700K',
-  '13th Gen Intel(R) Core(TM) i5-13600K', 'Intel(R) Core(TM) Ultra 7 155H',
-  'Intel(R) Core(TM) i9-14900K', 'AMD Ryzen 7 7800X3D', 'AMD Ryzen 9 7950X',
-  'AMD Ryzen 5 7600', 'Apple M1 Pro', 'Apple M2 Max', 'Apple M3 Pro', 'Apple M4',
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
+  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
+  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
+  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
+  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14 },
+  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24 },
+  { model: 'Intel(R) Core(TM) Ultra 7 155H', cores: 16 },
+  { model: 'Intel(R) Core(TM) Ultra 9 285H', cores: 16 },
+  { model: 'Intel(R) Core(TM) i9-14900K', cores: 24 },
+  { model: 'Intel(R) Core(TM) i7-14700K', cores: 20 },
+  { model: 'AMD Ryzen 7 7800X3D', cores: 8 },
+  { model: 'AMD Ryzen 9 7950X', cores: 16 },
+  { model: 'AMD Ryzen 5 7600', cores: 6 },
+  { model: 'AMD Ryzen 9 7900X', cores: 12 },
+  { model: 'AMD Ryzen 7 5800X3D', cores: 8 },
 ];
-const FINGERPRINT_CPUS_COUNT = [4, 6, 8, 10, 12, 14, 16, 20, 24, 32];
 const FINGERPRINT_MEMS = [8, 16, 24, 32, 48, 64];
 const FINGERPRINT_TZS = [
   'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'America/Toronto',
@@ -70,10 +76,7 @@ const FINGERPRINT_TZS = [
 const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
 
 function generateFingerprint() {
-  const plat = FINGERPRINT_PLATFORMS[Math.floor(Math.random() * FINGERPRINT_PLATFORMS.length)];
-  const release = plat.release[Math.floor(Math.random() * plat.release.length)];
-  const cpu = FINGERPRINT_CPUS[Math.floor(Math.random() * FINGERPRINT_CPUS.length)];
-  const cpuCount = FINGERPRINT_CPUS_COUNT[Math.floor(Math.random() * FINGERPRINT_CPUS_COUNT.length)];
+  const cpuEntry = FINGERPRINT_CPUS[Math.floor(Math.random() * FINGERPRINT_CPUS.length)];
   const memGiB = FINGERPRINT_MEMS[Math.floor(Math.random() * FINGERPRINT_MEMS.length)];
   const tz = FINGERPRINT_TZS[Math.floor(Math.random() * FINGERPRINT_TZS.length)];
   const macCount = FINGERPRINT_MAC_COUNT_RANGE[Math.floor(Math.random() * FINGERPRINT_MAC_COUNT_RANGE.length)];
@@ -90,7 +93,7 @@ function generateFingerprint() {
   const gitEmailHash = sha256(randHex(16));
 
   // thumbmark = 所有组件的联合哈希
-  const thumbData = [machineIdHash, ...macHashes, osUserHash, hostnameHash, gitEmailHash, plat.platform, release, cpu, String(cpuCount), String(memGiB)].join('|');
+  const thumbData = [machineIdHash, ...macHashes, osUserHash, hostnameHash, gitEmailHash, 'win32', '10.0.22631', cpuEntry.model, String(cpuEntry.cores), String(memGiB)].join('|');
   const thumbmark = sha256(thumbData);
 
   return {
@@ -101,11 +104,11 @@ function generateFingerprint() {
       osUserHash,
       hostnameHash,
       gitEmailHash,
-      platform: plat.platform,
-      arch: plat.arch,
-      osRelease: release,
-      cpuModel: cpu,
-      cpuCount,
+      platform: 'win32',
+      arch: 'x64',
+      osRelease: '10.0.22631',
+      cpuModel: cpuEntry.model,
+      cpuCount: cpuEntry.cores,
       memGiB,
       isContainer: false,
       timezone: tz,
@@ -259,7 +262,7 @@ async function ensureInitialized(apiKey, signal) {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
             mode: 'interactive',
-            os: `${process.platform}-${process.arch}`,
+            os: `${CFG.fingerprint.components.platform}-${CFG.fingerprint.components.arch}`,
           },
         }),
       }).then(r => {
