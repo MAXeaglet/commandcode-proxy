@@ -226,12 +226,14 @@ function getSessionId(incomingHeaders, apiKey) {
 // 每个请求独立 thread ID
 function newThreadId() { return randomUUID(); }
 
-// ── 首次初始化预请求（fingerprint + lifecycle，全局一次） ────
-let proxyInitialized = false;
+// ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
+const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
+const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
+let nextInitAt = 0;
 
 async function ensureInitialized(apiKey, signal) {
-  if (proxyInitialized) return;
-  proxyInitialized = true;
+  const now = Date.now();
+  if (now < nextInitAt) return;
 
   try {
     // 并行发两个预请求
@@ -272,9 +274,13 @@ async function ensureInitialized(apiKey, signal) {
         if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message });
       }),
     ]);
+
+    // 成功：8h + 2h 随机抖动
+    const jitter = Math.floor(Math.random() * INIT_JITTER_MS);
+    nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
+    log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` });
   } catch (e) {
-    if (e.name !== 'AbortError') log('warn', 'Initialization error', { error: e.message });
-    proxyInitialized = false; // 失败重试
+    if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
   }
 }
 
