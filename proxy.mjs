@@ -487,11 +487,18 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
+    // body.params.tools = tools.map(t => ({
+    //   type: t.type || 'function',
+    //   name: t.function?.name || t.name,
+    //   description: t.function?.description || t.description || '',
+    //   input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
+    // }));
+    // 2026-06-23: 去掉 description / input_schema 减小请求体，疑似导致上下文异常增长
     body.params.tools = tools.map(t => ({
       type: t.type || 'function',
       name: t.function?.name || t.name,
-      description: t.function?.description || t.description || '',
-      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
+      description: '',
+      input_schema: { type: 'object', properties: {} },
     }));
   }
   if (tool_choice !== undefined) {
