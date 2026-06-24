@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -46,6 +46,19 @@ function loadConfig() {
 }
 
 const CFG = loadConfig();
+
+// ── 请求体捕捉（调试用） ──────────────────────────
+const CAPTURE_DIR = CFG.captureDir || '';
+if (CAPTURE_DIR && !existsSync(CAPTURE_DIR)) {
+  try { mkdirSync(CAPTURE_DIR, { recursive: true }); } catch {}
+}
+
+function captureBody(route, body) {
+  if (!CAPTURE_DIR) return;
+  const ts = Date.now();
+  const file = `${CAPTURE_DIR}/${route}-${ts}.json`;
+  try { writeFileSync(file, JSON.stringify(body, null, 2)); } catch {}
+}
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -774,6 +787,7 @@ async function handleChatCompletions(req, res) {
   let openaiReq;
   try {
     openaiReq = await readBody(req);
+    captureBody('openai', openaiReq);
   } catch {
     sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
     return;
@@ -1479,6 +1493,7 @@ async function handleMessages(req, res) {
   let anthropicReq;
   try {
     anthropicReq = await readBody(req);
+    captureBody('anthropic', anthropicReq);
   } catch {
     sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
     return;
