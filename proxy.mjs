@@ -362,6 +362,21 @@ function getEnvironment() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
+function compactToolSchema(schema) {
+  if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
+  const props = {};
+  if (schema.properties) {
+    for (const [key, val] of Object.entries(schema.properties)) {
+      const p = { type: val.type || 'string' };
+      if (val.enum) p.enum = val.enum;
+      props[key] = p;
+    }
+  }
+  const r = { type: schema.type || 'object', properties: props };
+  if (schema.required) r.required = schema.required;
+  return r;
+}
+
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
 
@@ -474,19 +489,17 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
-    // body.params.tools = tools.map(t => ({
-    //   type: t.type || 'function',
-    //   name: t.function?.name || t.name,
-    //   description: t.function?.description || t.description || '',
-    //   input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
-    // }));
-    // 2026-06-23: 去掉 description / input_schema 减小请求体，疑似导致上下文异常增长
-    body.params.tools = tools.map(t => ({
-      type: t.type || 'function',
-      name: t.function?.name || t.name,
-      description: '',
-      input_schema: { type: 'object', properties: {} },
-    }));
+    const MAX_TOOL_DESC = 500;
+    body.params.tools = tools.map(t => {
+      const rawDesc = t.function?.description || t.description || '';
+      const schema = t.function?.parameters || t.input_schema || {};
+      return {
+        type: t.type || 'function',
+        name: t.function?.name || t.name,
+        description: rawDesc.slice(0, MAX_TOOL_DESC),
+        input_schema: compactToolSchema(schema),
+      };
+    });
   }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
