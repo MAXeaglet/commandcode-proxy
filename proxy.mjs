@@ -489,14 +489,16 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
-    const MAX_TOOL_DESC = 500;
     body.params.tools = tools.map(t => {
+      const name = t.function?.name || t.name || '';
       const rawDesc = t.function?.description || t.description || '';
       const schema = t.function?.parameters || t.input_schema || {};
+      // skill 工具带全量 skill 目录 XML，给更多空间保留发现能力
+      const maxDesc = name === 'skill' ? 3000 : 500;
       return {
         type: t.type || 'function',
-        name: t.function?.name || t.name,
-        description: rawDesc.slice(0, MAX_TOOL_DESC),
+        name,
+        description: rawDesc.slice(0, maxDesc),
         input_schema: compactToolSchema(schema),
       };
     });
