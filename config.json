@@ -5,6 +5,5 @@
   "apiBase": "https://api.commandcode.ai",
   "projectSlug": "cc-proxy",
   "logFile": "",
-  "logLevel": "info",
-  "captureDir": "captured-requests"
+  "logLevel": "info"
 }
