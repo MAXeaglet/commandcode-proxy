@@ -362,21 +362,6 @@ function getEnvironment() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
-function compactToolSchema(schema) {
-  if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
-  const props = {};
-  if (schema.properties) {
-    for (const [key, val] of Object.entries(schema.properties)) {
-      const p = { type: val.type || 'string' };
-      if (val.enum) p.enum = val.enum;
-      props[key] = p;
-    }
-  }
-  const r = { type: schema.type || 'object', properties: props };
-  if (schema.required) r.required = schema.required;
-  return r;
-}
-
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
 
@@ -489,19 +474,12 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
-    body.params.tools = tools.map(t => {
-      const name = t.function?.name || t.name || '';
-      const rawDesc = t.function?.description || t.description || '';
-      const schema = t.function?.parameters || t.input_schema || {};
-      // skill 工具带全量 skill 目录 XML，给更多空间保留发现能力
-      const maxDesc = name === 'skill' ? 3000 : 500;
-      return {
-        type: t.type || 'function',
-        name,
-        description: rawDesc.slice(0, maxDesc),
-        input_schema: compactToolSchema(schema),
-      };
-    });
+    body.params.tools = tools.map(t => ({
+      type: t.type || 'function',
+      name: t.function?.name || t.name || '',
+      description: t.function?.description || t.description || '',
+      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
+    }));
   }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
