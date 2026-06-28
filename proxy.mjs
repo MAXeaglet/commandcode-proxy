@@ -1838,9 +1838,9 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-      handleChatCompletions(req, res);
+      await handleChatCompletions(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
-      handleMessages(req, res);
+      await handleMessages(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
