@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -118,22 +118,6 @@ function generateFingerprint() {
   };
 }
 
-// 启动时确保 config.json 有 fingerprint
-(function ensureFingerprint() {
-  if (!CFG.fingerprint) {
-    CFG.fingerprint = generateFingerprint();
-    try {
-      const configPath = resolve(__dirname, 'config.json');
-      const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-      raw.fingerprint = CFG.fingerprint;
-      writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', 'utf-8');
-      log('info', 'Fingerprint generated and saved to config.json');
-    } catch (e) {
-      log('warn', 'Failed to save fingerprint to config.json', { error: e.message });
-    }
-  }
-})();
-
 let CC_VERSION = '0.32.3';
 const CC_VERSION_FALLBACK = '0.32.3';
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
@@ -197,13 +181,14 @@ function ensureSession(apiKey) {
   return sessionId;
 }
 
-// 定期清理过期 session，防止 Map 无限增长
+// 定期清理过期 session 和 key 状态，防止 Map 无限增长
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [key, entry] of sessionStore) {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
+      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
       cleaned++;
     }
   }
@@ -226,14 +211,31 @@ function getSessionId(incomingHeaders, apiKey) {
 // 每个请求独立 thread ID
 function newThreadId() { return randomUUID(); }
 
+// ── 每 Key 独立状态（fingerprint + 初始化节流） ──
+// 每个 API Key 拥有自己的设备指纹和初始化定时器
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+
+function getOrCreateKeyState(apiKey) {
+  let state = keyStateStore.get(apiKey);
+  if (!state) {
+    state = {
+      fingerprint: generateFingerprint(),
+      nextInitAt: 0,
+    };
+    keyStateStore.set(apiKey, state);
+    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
+  }
+  return state;
+}
+
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
-let nextInitAt = 0;
 
 async function ensureInitialized(apiKey, signal) {
+  const state = getOrCreateKeyState(apiKey);
   const now = Date.now();
-  if (now < nextInitAt) return;
+  if (now < state.nextInitAt) return;
 
   try {
     // 并行发两个预请求
@@ -243,7 +245,7 @@ async function ensureInitialized(apiKey, signal) {
       'Authorization': `Bearer ${apiKey}`,
       'x-command-code-version': CC_VERSION,
     };
-    const fingerprint = CFG.fingerprint || {};
+    const fingerprint = state.fingerprint || {};
 
     await Promise.all([
       fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
@@ -264,7 +266,7 @@ async function ensureInitialized(apiKey, signal) {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
             mode: 'interactive',
-            os: `${CFG.fingerprint.components.platform}-${CFG.fingerprint.components.arch}`,
+            os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
       }).then(r => {
@@ -277,7 +279,7 @@ async function ensureInitialized(apiKey, signal) {
 
     // 成功：8h + 2h 随机抖动
     const jitter = Math.floor(Math.random() * INIT_JITTER_MS);
-    nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
+    state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
     log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` });
   } catch (e) {
     if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
