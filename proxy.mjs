@@ -1855,6 +1855,16 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// 全局兜底：abort 触发的异步 rejection 不会让进程崩溃
+process.on('unhandledRejection', (reason) => {
+  if (reason?.name === 'AbortError' || reason?.code === 'ABORT_ERR') {
+    // 客户端断连触发的 abort — 预期行为，静默处理
+    log('info', 'Aborted request cleaned up');
+  } else {
+    log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
+  }
+});
+
 server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
