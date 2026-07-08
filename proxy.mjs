@@ -815,7 +815,7 @@ async function handleChatCompletions(req, res) {
 
     let reader = null;
     let translator = null;
-    const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = '';
+    const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
