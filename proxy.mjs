@@ -821,6 +821,21 @@ async function handleChatCompletions(req, res) {
     res.on('close', () => {
       if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
+      const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
+        : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
+        : 'client-hangup';
+      abortController.signal.aborted || log('warn', 'Client disconnected', {
+        path: '/v1/chat/completions',
+        model, completionId, reason,
+        streaming: stream,
+        elapsedMs: Date.now() - startTime,
+        bytesSent: bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        keepaliveCount,
+        inputTokens: translator?.inputTokens ?? 0,
+        outputTokens: translator?.outputTokens ?? 0,
+        cachedInputTokens: translator?.cachedInputTokens ?? 0,
+      });
       if (!abortController.signal.aborted) {
         // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
         try {
@@ -836,18 +851,6 @@ async function handleChatCompletions(req, res) {
         } catch {}
         try { abortController.abort(); } catch {}
       }
-      log('warn', 'Client disconnected', {
-        path: '/v1/chat/completions',
-        model,
-        completionId,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-        bytesSent: bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        inputTokens: translator?.inputTokens ?? 0,
-        outputTokens: translator?.outputTokens ?? 0,
-        cachedInputTokens: translator?.cachedInputTokens ?? 0,
-      });
     });
 
     if (stream) {
@@ -875,6 +878,7 @@ async function handleChatCompletions(req, res) {
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 
+          let hadOutput = false;
           for (const line of lines) {
             const events = translator.parseLine(line);
             if (events) {
@@ -888,9 +892,12 @@ async function handleChatCompletions(req, res) {
                 started = true;
               }
               for (const evt of events) res.write(evt);
+              hadOutput = true;
             }
             if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
           }
+          // silent events 期间发 keepalive，防止客户端超时断开
+          if (started && !hadOutput) { try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {} }
         }
 
         if (!aborted) {
@@ -1356,6 +1363,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
+      let hadOutput = false;
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed || trimmed === '[DONE]') continue;
@@ -1375,11 +1383,10 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
           case 'text-delta': {
             const text = event.text || '';
-            if (!text) break;
             const startBlock = startTextBlock();
-            if (startBlock) yield startBlock;
-            yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
-            outputTokens += Math.ceil(text.length / 4);
+            yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
+            outputTokens += 1;
+            hadOutput = true;
             break;
           }
 
