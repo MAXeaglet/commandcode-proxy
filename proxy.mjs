@@ -735,12 +735,19 @@ function sendJSON(res, status, data) {
 }
 
 function getApiKey(headers) {
+  // Try Authorization: Bearer header (OpenAI SDK style)
   const auth = headers['authorization'] || headers['Authorization'] || '';
-  if (!auth.startsWith('Bearer ')) return null;
-  // 从字符串中提取第一个 user_ 开头的 Key，自动清理空格/引号/多余路径
-  const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
-  if (!match) return null;
-  return match[0];
+  if (auth.startsWith('Bearer ')) {
+    const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  // Fall back to x-api-key header (Anthropic SDK style)
+  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
+  if (xKey) {
+    const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  return null;
 }
 
 // ── 流式转发 ────────────────────────────────────────
