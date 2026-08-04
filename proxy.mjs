@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Command Code → OpenAI 兼容代理
  * 基于真实 CLI 流量抓包数据构建
  */
@@ -790,7 +790,7 @@ async function handleChatCompletions(req, res) {
 
   const apiKey = getApiKey(req.headers);
   if (!apiKey) {
-    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> header', type: 'auth_error' } });
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
 
@@ -805,9 +805,11 @@ async function handleChatCompletions(req, res) {
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   const abortController = new AbortController();
   let aborted = false;
-  // 提前初始化，断连回调/超时 catch 安全引用（避免 TDZ ReferenceError）
+  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
   let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
+  let reader = null;
+  let translator = null;
 
   try {
     // 首次初始化（fingerprint + lifecycle）
@@ -822,9 +824,6 @@ async function handleChatCompletions(req, res) {
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
-
-    let reader = null;
-    let translator = null;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1503,7 +1502,7 @@ async function handleMessages(req, res) {
 
   const apiKey = getApiKey(req.headers);
   if (!apiKey) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> header' } });
+    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
 
@@ -1516,7 +1515,7 @@ async function handleMessages(req, res) {
 
   const abortController = new AbortController();
   let aborted = false;
-  // 提前初始化，断连回调/超时 catch 安全引用（避免 TDZ ReferenceError）
+  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
   let messageId = '';
   let reader = null;
