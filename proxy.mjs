@@ -735,12 +735,19 @@ function sendJSON(res, status, data) {
 }
 
 function getApiKey(headers) {
+  // Try Authorization: Bearer header (OpenAI SDK style)
   const auth = headers['authorization'] || headers['Authorization'] || '';
-  if (!auth.startsWith('Bearer ')) return null;
-  // 从字符串中提取第一个 user_ 开头的 Key，自动清理空格/引号/多余路径
-  const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
-  if (!match) return null;
-  return match[0];
+  if (auth.startsWith('Bearer ')) {
+    const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  // Fall back to x-api-key header (Anthropic SDK style)
+  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
+  if (xKey) {
+    const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  return null;
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -798,6 +805,9 @@ async function handleChatCompletions(req, res) {
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   const abortController = new AbortController();
   let aborted = false;
+  // 提前初始化，断连回调/超时 catch 安全引用（避免 TDZ ReferenceError）
+  const startTime = Date.now();
+  let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
 
   try {
     // 首次初始化（fingerprint + lifecycle）
@@ -815,7 +825,6 @@ async function handleChatCompletions(req, res) {
 
     let reader = null;
     let translator = null;
-    const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -980,7 +989,6 @@ async function handleChatCompletions(req, res) {
       if (!res.writableEnded) res.end();
     } else {
       // ── 非流式响应（缓冲完整 NDJSON）──
-      let fullText = '';
       let reasoningContent = '';
       let finishReason = 'stop';
       let usage = null;
@@ -1508,9 +1516,13 @@ async function handleMessages(req, res) {
 
   const abortController = new AbortController();
   let aborted = false;
+  // 提前初始化，断连回调/超时 catch 安全引用（避免 TDZ ReferenceError）
+  const startTime = Date.now();
+  let messageId = '';
+  let reader = null;
+  let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    let reader = null;
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
@@ -1522,8 +1534,6 @@ async function handleMessages(req, res) {
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
-    const startTime = Date.now();
-    let messageId = '';
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1658,7 +1668,9 @@ async function handleMessages(req, res) {
     } else {
       // ── 非流式 Anthropic JSON ──
       const messageId = 'msg_' + randomUUID().slice(0, 12);
-      let bytesReceived = 0; let lastCcEvent = '';
+      let finishReason = 'stop';
+      let usage = null;
+      let toolCalls = null;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
