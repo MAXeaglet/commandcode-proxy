@@ -4,20 +4,20 @@
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
 
-基于对官方 CLI v0.32.3 网络流量的分析，精确还原了 Command Code API 的请求协议，并实现了多层兼容适配。
+基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
 
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 客户端断连检测（上游中止） | 零输出 → 502 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
 ## 快速开始
 
 ```bash
-npm start        # 启动（默认 http://0.0.0.0:3000）
+npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:3050）
 npm run dev      # watch 模式（文件修改自动重启）
 ```
 
-API Key 通过 `Authorization` 请求头传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
+API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
 
 ```bash
 curl http://127.0.0.1:3050/v1/chat/completions \
@@ -33,10 +33,14 @@ commandcode/
 ├── config.json           # 端口 / 日志路径等
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1600 行）
+├── proxy.mjs             # 单文件核心代理（~1900 行）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
+├── .github/
+│   └── workflows/
+│       └── docker-publish.yml  # 打 v* tag 时自动发布 GHCR 多架构镜像
+├── captured-requests/    # CLI 抓包数据（协议逆向参考）
 ├── README.md             # 英文文档
 └── README_zh.md          # 本文档（中文）
 ```
@@ -47,10 +51,11 @@ commandcode/
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `port` | `3000` | 监听端口 |
+| `port` | `3000` | 监听端口（仓库自带 config.json 为 3050） |
 | `host` | `0.0.0.0` | 监听地址 |
 | `apiBase` | `https://api.commandcode.ai` | CC API 地址 |
 | `projectSlug` | `cc-proxy` | `x-project-slug` header |
+| `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
@@ -242,10 +247,9 @@ data: {"type":"message_stop"}
 | HTTP 状态 | 说明 |
 |-----------|------|
 | 400 | 请求格式错误 |
-| 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头） |
-| 429 | 流空闲超时（30s 流式 / 90s 非流式，SDK 自动重试，连续 3 次：提示压缩上下文） |
-| 502 | 零输出 token 或 CC 上游错误 |
-| 503 | 服务暂时不可用 |
+| 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入） |
+| 429 | 零输出 token，或流空闲超时（30s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
+| 502 | CC 上游错误 |
 
 ## 模型列表
 
@@ -253,16 +257,18 @@ data: {"type":"message_stop"}
 
 ### 常用模型
 
-| 模型 ID | 说明 | 特性 |
-|---------|------|------|
-| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | 快速通用 |
-| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | 高精度推理 |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 | 长文本 |
-| `claude-opus-4-8` | Claude Opus 4.8 | 最强推理 |
-| `moonshotai/Kimi-K2.5` | Kimi K2.5 | 多模态/前端 |
-| `xiaomi/mimo-v2.5` | MiMo V2.5 | **支持图片输入** |
-| `Qwen/Qwen3.7-Max` | Qwen 3.7 Max | 大参数量 |
-| `google/gemini-3.5-flash` | Gemini 3.5 Flash | 推理模型 |
+| 模型 ID | 提供商 |
+|---------|--------|
+| `claude-sonnet-4-6` / `claude-opus-4-8` / `claude-opus-4-7` / `claude-haiku-4-5-20251001` | Anthropic |
+| `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` | OpenAI |
+| `deepseek/deepseek-v4-pro` / `deepseek/deepseek-v4-flash` | DeepSeek |
+| `moonshotai/Kimi-K2.6` / `moonshotai/Kimi-K2.5` | Kimi |
+| `zai-org/GLM-5.1` / `zai-org/GLM-5` | GLM |
+| `MiniMaxAI/MiniMax-M3` / `MiniMaxAI/MiniMax-M2.7` / `MiniMaxAI/MiniMax-M2.5` | MiniMax |
+| `Qwen/Qwen3.7-Max` / `Qwen/Qwen3.6-Max-Preview` / `Qwen/Qwen3.6-Plus` | Qwen |
+| `stepfun/Step-3.7-Flash` / `stepfun/Step-3.5-Flash` | Step |
+| `xiaomi/mimo-v2.5-pro` / `xiaomi/mimo-v2.5` | Xiaomi（**支持图片输入**） |
+| `google/gemini-3.5-flash` / `google/gemini-3.1-flash-lite` | Gemini |
 
 > ⚠️ 部分模型（如 `deepseek-v4-flash`、`claude-sonnet-4-6`）不支持图片输入。如需多模态请用 `xiaomi/mimo-v2.5`、`Kimi-K2.5` 等 vision 模型。
 
@@ -321,6 +327,8 @@ message = client.messages.create(
 print(message.content[0].text)
 ```
 
+Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `Authorization` 头）。
+
 ### OpenCode
 ```json
 {
@@ -332,21 +340,23 @@ print(message.content[0].text)
 
 ## 反检测
 
-基于对官方 CLI v0.32.3 流量的分析，实现了以下兼容适配：
+基于对官方 CLI 网络流量的分析（版本号从 npm registry 动态拉取），实现了以下兼容适配：
 
 | 机制 | 实现 |
 |------|------|
+| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
+| **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
 | **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
-| **CLI 信封格式** | config/memory/taste/permissionMode/params/threadId |
+| **CLI 信封格式** | config/memory/taste/skills/permissionMode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production` |
-| **Project Slug** | 自定义 `x-project-slug` |
+| **环境标识** | `x-cli-environment: production`、`x-co-flag: "false"`、`x-taste-learning: "false"` |
+| **Project Slug** | 从 sessionId 生成的 `x-project-slug`（与真实 CLI 格式一致） |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
-| **API Key 格式验证** | 正则 `user_[a-zA-Z0-9_-]+`，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
+| **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
-| **零输出防护** | outputTokens=0 → 502 错误（SDK 自动重试，反异常计费） |
+| **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
 | **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
 | **隐私保护日志** | 日志不含 API Key 片段、错误 body、stack trace |
 
@@ -367,8 +377,8 @@ print(message.content[0].text)
     "gitStatus": "",
     "recentCommits": []
   },
-  "memory": "",
-  "taste": "",
+  "memory": null,
+  "taste": null,
   "skills": "",
   "permissionMode": "standard",
   "params": {
@@ -377,10 +387,11 @@ print(message.content[0].text)
     "max_tokens": 64000,
     "stream": true,
     "reasoning_effort": "max"
-  },
-  "threadId": "<uuid>"
+  }
 }
 ```
+
+条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`、`tools`（映射为 CC `input_schema` 格式）。
 
 ### CC API 图片消息格式
 
@@ -449,7 +460,7 @@ npm run docker:build:multi
 
 - **非官方**：本项目与 Command Code 无任何关联，非官方产品。
 - **个人使用**：使用者应自行承担所有责任。请遵守 [Command Code 服务条款](https://commandcode.ai/tos)。
-- **API Key**：本项目不会收集、上传或泄露你的 API Key。Key 必须在每次请求的 `Authorization: Bearer <key>` 头中传入，不存储在配置中。
+- **API Key**：本项目不会收集、上传或泄露你的 API Key。Key 通过每次请求的 `Authorization: Bearer <key>` 或 `x-api-key` 头传入，日志中不记录；`config.json` 中的可选 `apiKey` 字段仅作本地兜底，不会离开你的机器。
 - **合规性**：协议基于对本地 CLI 网络流量的被动观察，未对服务端进行任何未授权访问、破解或篡改。
 - **账号风险**：建议和正常 CLI 使用频率保持一致，超高并发调用可能触发风控。
 
