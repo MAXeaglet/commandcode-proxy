@@ -400,6 +400,17 @@ CLI 发送图片的格式：
 
 ## Docker 部署
 
+### 从 GHCR 拉取
+
+每次打 `v*` tag 时 GitHub Actions 会自动构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+```
+
+每次发版都会更新 `latest` 标签。镜像为公共可见，拉取无需登录。
+
 ### 快速启动 (docker compose)
 
 ```bash
