@@ -1135,8 +1135,22 @@ function mapAnthropicStopReason(finishReason) {
   }
 }
 
-function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage) {
+// Generate a Claude-format fake signature for thinking blocks.
+// Anthropic validates thinking signatures cryptographically; third-party
+// proxies cannot mint valid ones. Claude Code's shallow check only requires
+// base64 starting with 'E' (single-layer) / 'R' (double-layer) with payload
+// first byte 0x12 — this satisfies that, letting CC display thinking.
+// The payload is derived from the thinking text so each block's signature
+// differs (closer to spec, avoids identical-signature quirks).
+function fakeThinkingSignature(thinkingText) {
+  const seed = crypto.createHash('sha256').update(thinkingText || 'dsh-proxy-thinking').digest().subarray(0, 64);
+  const raw = Buffer.concat([Buffer.from([0x12, seed.length]), seed]);
+  return raw.toString('base64');
+}
+
+function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText) {
   const content = [];
+  if (thinkingText) content.push({ type: 'thinking', thinking: thinkingText, signature: fakeThinkingSignature(thinkingText) });
   if (fullText) content.push({ type: 'text', text: fullText });
   if (toolCalls) {
     for (const tc of toolCalls) {
@@ -1315,27 +1329,47 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let cacheWriteTokens = 0;
   let stopReason = null;
   let hasError = false;
+  let currentThinkingText = ''; // accumulated thinking text for the open block
 
-  // Close the current text block if one is active
-  function closeTextBlock() {
-    if (blockStarted && currentBlockType === 'text') {
+  // Close the current block (text or thinking) if one is active.
+  // For thinking blocks, emit a signature_delta (Anthropic standard) before stop.
+  function closeBlock() {
+    if (blockStarted) {
+      const idx = currentBlockIndex;
+      const type = currentBlockType;
+      let out = '';
+      if (type === 'thinking') {
+        out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'signature_delta', signature: fakeThinkingSignature(currentThinkingText) } })}\n\n`;
+        currentThinkingText = '';
+      }
       blockStarted = false;
       currentBlockType = null;
-      return `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: currentBlockIndex })}\n\n`;
+      return out + `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`;
+    }
+    return '';
+  }
+  const closeTextBlock = closeBlock;
+
+  // Open a new block of the given type (closing any previous block first)
+  function startBlock(type, contentBlock) {
+    if (!blockStarted || currentBlockType !== type) {
+      const close = closeBlock();
+      currentBlockIndex = nextBlockIndex++;
+      currentBlockType = type;
+      blockStarted = true;
+      return close + `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: contentBlock })}\n\n`;
     }
     return '';
   }
 
   // Open a new text block (closing any previous block first)
   function startTextBlock() {
-    if (!blockStarted || currentBlockType !== 'text') {
-      const close = closeTextBlock();
-      currentBlockIndex = nextBlockIndex++;
-      currentBlockType = 'text';
-      blockStarted = true;
-      return close + `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: { type: 'text', text: '' } })}\n\n`;
-    }
-    return '';
+    return startBlock('text', { type: 'text', text: '' });
+  }
+
+  // Open a new thinking block (closing any previous block first)
+  function startThinkingBlock() {
+    return startBlock('thinking', { type: 'thinking', thinking: '' });
   }
 
   // Emit message_start (always the first event)
@@ -1384,9 +1418,16 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             // Signal events, no user-visible data
             break;
 
-          case 'reasoning-delta':
-            // Anthropic Messages API default mode doesn't expose thinking blocks
+          case 'reasoning-delta': {
+            // CC reasoning → Anthropic thinking block (Claude Code shows this as thinking)
+            const text = event.text || '';
+            if (!text) break;
+            const startBlock = startThinkingBlock();
+            currentThinkingText += text;
+            yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`;
+            hadOutput = true;
             break;
+          }
 
           case 'text-delta': {
             const text = event.text || '';
@@ -1670,6 +1711,7 @@ async function handleMessages(req, res) {
       let finishReason = 'stop';
       let usage = null;
       let toolCalls = null;
+      let thinkingText = ''; // CC reasoning → Anthropic thinking block
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1685,6 +1727,7 @@ async function handleMessages(req, res) {
             const event = JSON.parse(trimmed);
             switch (event.type) {
               case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
+              case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
               case 'tool-call':
                 lastCcEvent = event.type;
                 (toolCalls = toolCalls || []).push({
@@ -1739,7 +1782,7 @@ async function handleMessages(req, res) {
       }
 
       consecutiveTimeouts = 0;
-      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
+      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
   } catch (e) {
     if (abortController.signal.aborted) {
