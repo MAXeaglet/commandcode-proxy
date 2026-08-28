@@ -367,10 +367,12 @@ function getEnvironment() {
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
 
-  // 从 messages 中提取 system prompt
-  const systemMsgs = messages.filter(m => m.role === 'system');
-  const systemPrompt = systemMsgs.map(m => m.content).join('\n');
-  const chatMessages = messages.filter(m => m.role !== 'system');
+  // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
+  const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
+  const systemPrompt = systemMsgs.map(m =>
+    typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+  ).join('\n');
+  const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
   const toolNameMap = {};
@@ -436,7 +438,8 @@ function buildCcRequest(openaiReq) {
         }],
       };
     }
-    return msg;
+    // 未知 role 兜底：归一化为 user 并保证 content 为数组，避免 CC 校验拒绝
+    return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
 
   const threadId = newThreadId();
