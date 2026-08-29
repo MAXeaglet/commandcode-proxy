@@ -60,6 +60,7 @@ commandcode/
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
+| `zdr` | `false` | 强制零数据保留：所有上游请求附加 `x-cmd-zdr: 1` |
 
 ### 环境变量
 
@@ -71,6 +72,7 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_ZDR` | `zdr`（`1`/`true` 开启） |
 
 ## API 接口
 
