@@ -195,11 +195,13 @@ setInterval(() => {
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
 }, 60 * 60 * 1000); // 每小时
 
-function getSessionId(incomingHeaders, apiKey) {
+function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
+    incomingHeaders['session_id'],
+    promptCacheKey,
   ];
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
@@ -752,10 +754,10 @@ function getApiKey(headers) {
 
 // ── 流式转发 ────────────────────────────────────────
 
-async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
+async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey);
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -815,7 +817,7 @@ async function handleChatCompletions(req, res) {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
