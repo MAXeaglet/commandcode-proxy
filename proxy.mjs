@@ -367,7 +367,7 @@ function getEnvironment() {
 // ── CC 请求体构建 ─────────────────────────────────
 
 function buildCcRequest(openaiReq) {
-  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
+  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 从 messages 中提取 system prompt
   const systemMsgs = messages.filter(m => m.role === 'system');
@@ -440,6 +440,14 @@ function buildCcRequest(openaiReq) {
     }
     return msg;
   });
+
+  const hasMessageCacheMarker = ccMessages.some(msg =>
+    Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
+  if (prompt_cache_key && !hasMessageCacheMarker) {
+    const firstUserMessage = ccMessages.find(msg => msg.role === 'user' && Array.isArray(msg.content));
+    const cacheBoundary = firstUserMessage?.content.findLast(part => part?.type === 'text');
+    if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
+  }
 
   const threadId = newThreadId();
 
