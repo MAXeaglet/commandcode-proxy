@@ -517,6 +517,7 @@ function createSseTranslator(model, completionId, created) {
 
   return {
     lastCcEvent: '',
+    upstreamError: null,
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
@@ -606,6 +607,7 @@ function createSseTranslator(model, completionId, created) {
         case 'error': {
           const msg = event.error?.message || event.message || 'Unknown error';
           log('warn', 'CC stream error', { message: msg });
+          this.upstreamError = mapCcEventError(event);
           // Don't emit a finish_reason chunk — let the natural stream termination
           // handle it. Otherwise a subsequent finish(tool_calls) would be ignored
           // by downstream agent loops that stop at the first finish_reason.
@@ -699,6 +701,15 @@ function mapCcError(ccStatus, ccBody) {
       },
     };
   }
+
+  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+}
+
+function mapCcEventError(event) {
+  const message = event.error?.message || event.message || 'Unknown CC error';
+  const statusMatch = message.match(/^<(\d{3})>/);
+  const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
+  const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
   return { status: mapped.status, body: { error: { message, type: mapped.type } } };
 }
@@ -919,8 +930,14 @@ async function handleChatCompletions(req, res) {
               for (const evt of events) res.write(evt);
             }
           }
+          if (translator.upstreamError) {
+            if (!started) {
+              sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
+              return;
+            }
+            try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
-          if (translator.outputTokens === 0) {
+          } else if (translator.outputTokens === 0) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -992,6 +1009,7 @@ async function handleChatCompletions(req, res) {
       let finishReason = 'stop';
       let usage = null;
       let toolCalls = null;
+      let upstreamError = null;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1028,6 +1046,7 @@ async function handleChatCompletions(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+                upstreamError = mapCcEventError(event);
                 break;
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content
@@ -1054,6 +1073,11 @@ async function handleChatCompletions(req, res) {
         processLines();
       }
       processLines();
+
+      if (upstreamError) {
+        sendJSON(res, upstreamError.status, upstreamError.body);
+        return;
+      }
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
@@ -1482,8 +1506,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
           case 'error': {
             hasError = true;
-            const msg = event.error?.message || event.message || 'Unknown CC error';
-            yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: msg } })}\n\n`;
+            const upstreamError = mapCcEventError(event);
+            ctx.upstreamError = upstreamError;
+            yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error })}\n\n`;
             break;
           }
 
@@ -1608,7 +1633,7 @@ async function handleMessages(req, res) {
       let ctx;
       try {
         messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null };
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
@@ -1633,7 +1658,16 @@ async function handleMessages(req, res) {
 
         if (!aborted) {
           consecutiveTimeouts = 0;
-          if (ctx.outputTokens === 0) {
+          if (ctx.upstreamError) {
+            if (!started) {
+              sendAnthropicError(
+                res,
+                ctx.upstreamError.status,
+                ctx.upstreamError.body.error.type,
+                ctx.upstreamError.body.error.message,
+              );
+            }
+          } else if (ctx.outputTokens === 0) {
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
@@ -1712,6 +1746,7 @@ async function handleMessages(req, res) {
       let usage = null;
       let toolCalls = null;
       let thinkingText = ''; // CC reasoning → Anthropic thinking block
+      let upstreamError = null;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1747,6 +1782,7 @@ async function handleMessages(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
+                upstreamError = mapCcEventError(event);
                 break;
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content
@@ -1773,6 +1809,11 @@ async function handleMessages(req, res) {
         processLines();
       }
       processLines();
+
+      if (upstreamError) {
+        sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
+        return;
+      }
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
