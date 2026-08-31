@@ -382,10 +382,16 @@ function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
+  // 数组型 content 必须展开取 text 后拼成「字符串」，而不是转成 JSON 字符串、
+  // 更不能输出 Anthropic 风格的 content 块数组：CC 原生客户端的 31 个
+  // /alpha/generate 抓包中 params.system 出现 15 次，全部是 str，且真实流量里
+  // 从未出现 cache_control 字段。
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
-  const systemPrompt = systemMsgs.map(m =>
-    typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
-  ).join('\n');
+  const systemPrompt = systemMsgs.map(m => {
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) return m.content.map(c => c?.text ?? c?.content ?? '').join('\n');
+    return m.content == null ? '' : String(m.content);
+  }).join('\n');
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
