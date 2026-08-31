@@ -335,8 +335,20 @@ const MODELS = [
 function fakeProjectSlug(sessionId) {
   const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
     'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
-  const name = names[parseInt(sessionId.slice(0, 4), 16) % names.length];
-  const suffix = sessionId.slice(0, 4);
+  const id = String(sessionId || '');
+  const head = id.slice(0, 4);
+  // sessionId 既可能是随机 UUID（前 4 位是十六进制），也可能是客户端自定义的
+  // prompt_cache_key（例如 "my-stable-cache-key-001"）。后者按 16 进制解析会得到
+  // NaN，进而让 slug 变成 "…-undefined-my-s"。先按十六进制解析，失败则退化为
+  // 确定性字符哈希，保证同一 session 仍映射到同一个 slug。
+  let idx = parseInt(head, 16);
+  if (!Number.isFinite(idx)) {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    idx = h;
+  }
+  const name = names[idx % names.length];
+  const suffix = head || '0000';
   // 模拟一个类似 C:\Users\dev\projects\{name}-{suffix} 的路径
   const path = `C:\\Users\\dev\\projects\\${name}-${suffix}`;
   return path
@@ -723,6 +735,15 @@ function mapCcEventError(event) {
   const statusMatch = message.match(/^<(\d{3})>/);
   const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
+
+  // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
+  // 否则客户端 SDK 拿不到退避提示（402 也映射成 429，一视同仁）
+  if (mapped.status === 429) {
+    return {
+      status: 429,
+      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+    };
+  }
 
   return { status: mapped.status, body: { error: { message, type: mapped.type } } };
 }
