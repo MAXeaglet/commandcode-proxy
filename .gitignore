@@ -6,4 +6,5 @@ node_modules/
 AGENTS.md
 stdout.txt
 stderr.txt
+captured-requests/
 

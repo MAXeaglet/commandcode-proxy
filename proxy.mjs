@@ -195,11 +195,13 @@ setInterval(() => {
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
 }, 60 * 60 * 1000); // 每小时
 
-function getSessionId(incomingHeaders, apiKey) {
+function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
+    incomingHeaders['session_id'],
+    promptCacheKey,
   ];
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
@@ -333,8 +335,20 @@ const MODELS = [
 function fakeProjectSlug(sessionId) {
   const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
     'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
-  const name = names[parseInt(sessionId.slice(0, 4), 16) % names.length];
-  const suffix = sessionId.slice(0, 4);
+  const id = String(sessionId || '');
+  const head = id.slice(0, 4);
+  // sessionId 既可能是随机 UUID（前 4 位是十六进制），也可能是客户端自定义的
+  // prompt_cache_key（例如 "my-stable-cache-key-001"）。后者按 16 进制解析会得到
+  // NaN，进而让 slug 变成 "…-undefined-my-s"。先按十六进制解析，失败则退化为
+  // 确定性字符哈希，保证同一 session 仍映射到同一个 slug。
+  let idx = parseInt(head, 16);
+  if (!Number.isFinite(idx)) {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    idx = h;
+  }
+  const name = names[idx % names.length];
+  const suffix = head || '0000';
   // 模拟一个类似 C:\Users\dev\projects\{name}-{suffix} 的路径
   const path = `C:\\Users\\dev\\projects\\${name}-${suffix}`;
   return path
@@ -365,12 +379,14 @@ function getEnvironment() {
 // ── CC 请求体构建 ─────────────────────────────────
 
 function buildCcRequest(openaiReq) {
-  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
+  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
-  // 从 messages 中提取 system prompt
-  const systemMsgs = messages.filter(m => m.role === 'system');
-  const systemPrompt = systemMsgs.map(m => m.content).join('\n');
-  const chatMessages = messages.filter(m => m.role !== 'system');
+  // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
+  const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
+  const systemPrompt = systemMsgs.map(m =>
+    typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+  ).join('\n');
+  const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
   const toolNameMap = {};
@@ -436,8 +452,17 @@ function buildCcRequest(openaiReq) {
         }],
       };
     }
-    return msg;
+    // 未知 role 兜底：归一化为 user 并保证 content 为数组，避免 CC 校验拒绝
+    return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
+
+  const hasMessageCacheMarker = ccMessages.some(msg =>
+    Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
+  if (prompt_cache_key && !hasMessageCacheMarker) {
+    const firstUserMessage = ccMessages.find(msg => msg.role === 'user' && Array.isArray(msg.content));
+    const cacheBoundary = firstUserMessage?.content.findLast(part => part?.type === 'text');
+    if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
+  }
 
   const threadId = newThreadId();
 
@@ -517,6 +542,7 @@ function createSseTranslator(model, completionId, created) {
 
   return {
     lastCcEvent: '',
+    upstreamError: null,
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
@@ -606,6 +632,7 @@ function createSseTranslator(model, completionId, created) {
         case 'error': {
           const msg = event.error?.message || event.message || 'Unknown error';
           log('warn', 'CC stream error', { message: msg });
+          this.upstreamError = mapCcEventError(event);
           // Don't emit a finish_reason chunk — let the natural stream termination
           // handle it. Otherwise a subsequent finish(tool_calls) would be ignored
           // by downstream agent loops that stop at the first finish_reason.
@@ -703,6 +730,24 @@ function mapCcError(ccStatus, ccBody) {
   return { status: mapped.status, body: { error: { message, type: mapped.type } } };
 }
 
+function mapCcEventError(event) {
+  const message = event.error?.message || event.message || 'Unknown CC error';
+  const statusMatch = message.match(/^<(\d{3})>/);
+  const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
+  const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
+
+  // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
+  // 否则客户端 SDK 拿不到退避提示（402 也映射成 429，一视同仁）
+  if (mapped.status === 429) {
+    return {
+      status: 429,
+      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+    };
+  }
+
+  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+}
+
 // ── HTTP 请求处理 ──────────────────────────────────
 
 function readBody(req) {
@@ -735,20 +780,27 @@ function sendJSON(res, status, data) {
 }
 
 function getApiKey(headers) {
+  // Try Authorization: Bearer header (OpenAI SDK style)
   const auth = headers['authorization'] || headers['Authorization'] || '';
-  if (!auth.startsWith('Bearer ')) return null;
-  // 从字符串中提取第一个 user_ 开头的 Key，自动清理空格/引号/多余路径
-  const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
-  if (!match) return null;
-  return match[0];
+  if (auth.startsWith('Bearer ')) {
+    const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  // Fall back to x-api-key header (Anthropic SDK style)
+  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
+  if (xKey) {
+    const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
+    if (match) return match[0];
+  }
+  return null;
 }
 
 // ── 流式转发 ────────────────────────────────────────
 
-async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
+async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey);
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -783,7 +835,7 @@ async function handleChatCompletions(req, res) {
 
   const apiKey = getApiKey(req.headers);
   if (!apiKey) {
-    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> header', type: 'auth_error' } });
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
 
@@ -798,12 +850,17 @@ async function handleChatCompletions(req, res) {
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   const abortController = new AbortController();
   let aborted = false;
+  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
+  const startTime = Date.now();
+  let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
+  let reader = null;
+  let translator = null;
 
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -812,10 +869,6 @@ async function handleChatCompletions(req, res) {
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
-
-    let reader = null;
-    let translator = null;
-    const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -911,8 +964,14 @@ async function handleChatCompletions(req, res) {
               for (const evt of events) res.write(evt);
             }
           }
+          if (translator.upstreamError) {
+            if (!started) {
+              sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
+              return;
+            }
+            try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
-          if (translator.outputTokens === 0) {
+          } else if (translator.outputTokens === 0) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -980,11 +1039,11 @@ async function handleChatCompletions(req, res) {
       if (!res.writableEnded) res.end();
     } else {
       // ── 非流式响应（缓冲完整 NDJSON）──
-      let fullText = '';
       let reasoningContent = '';
       let finishReason = 'stop';
       let usage = null;
       let toolCalls = null;
+      let upstreamError = null;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1021,6 +1080,10 @@ async function handleChatCompletions(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+                upstreamError = mapCcEventError(event);
+                break;
+              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+                // Silent - no user-visible content
                 break;
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content
@@ -1047,6 +1110,11 @@ async function handleChatCompletions(req, res) {
         processLines();
       }
       processLines();
+
+      if (upstreamError) {
+        sendJSON(res, upstreamError.status, upstreamError.body);
+        return;
+      }
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
@@ -1128,8 +1196,22 @@ function mapAnthropicStopReason(finishReason) {
   }
 }
 
-function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage) {
+// Generate a Claude-format fake signature for thinking blocks.
+// Anthropic validates thinking signatures cryptographically; third-party
+// proxies cannot mint valid ones. Claude Code's shallow check only requires
+// base64 starting with 'E' (single-layer) / 'R' (double-layer) with payload
+// first byte 0x12 — this satisfies that, letting CC display thinking.
+// The payload is derived from the thinking text so each block's signature
+// differs (closer to spec, avoids identical-signature quirks).
+function fakeThinkingSignature(thinkingText) {
+  const seed = crypto.createHash('sha256').update(thinkingText || 'dsh-proxy-thinking').digest().subarray(0, 64);
+  const raw = Buffer.concat([Buffer.from([0x12, seed.length]), seed]);
+  return raw.toString('base64');
+}
+
+function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText) {
   const content = [];
+  if (thinkingText) content.push({ type: 'thinking', thinking: thinkingText, signature: fakeThinkingSignature(thinkingText) });
   if (fullText) content.push({ type: 'text', text: fullText });
   if (toolCalls) {
     for (const tc of toolCalls) {
@@ -1308,27 +1390,47 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let cacheWriteTokens = 0;
   let stopReason = null;
   let hasError = false;
+  let currentThinkingText = ''; // accumulated thinking text for the open block
 
-  // Close the current text block if one is active
-  function closeTextBlock() {
-    if (blockStarted && currentBlockType === 'text') {
+  // Close the current block (text or thinking) if one is active.
+  // For thinking blocks, emit a signature_delta (Anthropic standard) before stop.
+  function closeBlock() {
+    if (blockStarted) {
+      const idx = currentBlockIndex;
+      const type = currentBlockType;
+      let out = '';
+      if (type === 'thinking') {
+        out += `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'signature_delta', signature: fakeThinkingSignature(currentThinkingText) } })}\n\n`;
+        currentThinkingText = '';
+      }
       blockStarted = false;
       currentBlockType = null;
-      return `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: currentBlockIndex })}\n\n`;
+      return out + `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`;
+    }
+    return '';
+  }
+  const closeTextBlock = closeBlock;
+
+  // Open a new block of the given type (closing any previous block first)
+  function startBlock(type, contentBlock) {
+    if (!blockStarted || currentBlockType !== type) {
+      const close = closeBlock();
+      currentBlockIndex = nextBlockIndex++;
+      currentBlockType = type;
+      blockStarted = true;
+      return close + `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: contentBlock })}\n\n`;
     }
     return '';
   }
 
   // Open a new text block (closing any previous block first)
   function startTextBlock() {
-    if (!blockStarted || currentBlockType !== 'text') {
-      const close = closeTextBlock();
-      currentBlockIndex = nextBlockIndex++;
-      currentBlockType = 'text';
-      blockStarted = true;
-      return close + `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: { type: 'text', text: '' } })}\n\n`;
-    }
-    return '';
+    return startBlock('text', { type: 'text', text: '' });
+  }
+
+  // Open a new thinking block (closing any previous block first)
+  function startThinkingBlock() {
+    return startBlock('thinking', { type: 'thinking', thinking: '' });
   }
 
   // Emit message_start (always the first event)
@@ -1377,9 +1479,16 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             // Signal events, no user-visible data
             break;
 
-          case 'reasoning-delta':
-            // Anthropic Messages API default mode doesn't expose thinking blocks
+          case 'reasoning-delta': {
+            // CC reasoning → Anthropic thinking block (Claude Code shows this as thinking)
+            const text = event.text || '';
+            if (!text) break;
+            const startBlock = startThinkingBlock();
+            currentThinkingText += text;
+            yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`;
+            hadOutput = true;
             break;
+          }
 
           case 'text-delta': {
             const text = event.text || '';
@@ -1434,8 +1543,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
           case 'error': {
             hasError = true;
-            const msg = event.error?.message || event.message || 'Unknown CC error';
-            yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: msg } })}\n\n`;
+            const upstreamError = mapCcEventError(event);
+            ctx.upstreamError = upstreamError;
+            yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error })}\n\n`;
             break;
           }
 
@@ -1495,7 +1605,7 @@ async function handleMessages(req, res) {
 
   const apiKey = getApiKey(req.headers);
   if (!apiKey) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> header' } });
+    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
 
@@ -1508,9 +1618,13 @@ async function handleMessages(req, res) {
 
   const abortController = new AbortController();
   let aborted = false;
+  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
+  const startTime = Date.now();
+  let messageId = '';
+  let reader = null;
+  let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    let reader = null;
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
@@ -1522,8 +1636,6 @@ async function handleMessages(req, res) {
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
-    const startTime = Date.now();
-    let messageId = '';
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1558,7 +1670,7 @@ async function handleMessages(req, res) {
       let ctx;
       try {
         messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null };
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
@@ -1583,7 +1695,16 @@ async function handleMessages(req, res) {
 
         if (!aborted) {
           consecutiveTimeouts = 0;
-          if (ctx.outputTokens === 0) {
+          if (ctx.upstreamError) {
+            if (!started) {
+              sendAnthropicError(
+                res,
+                ctx.upstreamError.status,
+                ctx.upstreamError.body.error.type,
+                ctx.upstreamError.body.error.message,
+              );
+            }
+          } else if (ctx.outputTokens === 0) {
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
@@ -1658,7 +1779,11 @@ async function handleMessages(req, res) {
     } else {
       // ── 非流式 Anthropic JSON ──
       const messageId = 'msg_' + randomUUID().slice(0, 12);
-      let bytesReceived = 0; let lastCcEvent = '';
+      let finishReason = 'stop';
+      let usage = null;
+      let toolCalls = null;
+      let thinkingText = ''; // CC reasoning → Anthropic thinking block
+      let upstreamError = null;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1674,6 +1799,7 @@ async function handleMessages(req, res) {
             const event = JSON.parse(trimmed);
             switch (event.type) {
               case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
+              case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
               case 'tool-call':
                 lastCcEvent = event.type;
                 (toolCalls = toolCalls || []).push({
@@ -1693,6 +1819,10 @@ async function handleMessages(req, res) {
               case 'error':
                 lastCcEvent = event.type;
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
+                upstreamError = mapCcEventError(event);
+                break;
+              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+                // Silent - no user-visible content
                 break;
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content
@@ -1720,6 +1850,11 @@ async function handleMessages(req, res) {
       }
       processLines();
 
+      if (upstreamError) {
+        sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
+        return;
+      }
+
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1728,7 +1863,7 @@ async function handleMessages(req, res) {
       }
 
       consecutiveTimeouts = 0;
-      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
+      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
   } catch (e) {
     if (abortController.signal.aborted) {

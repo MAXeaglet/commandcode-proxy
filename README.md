@@ -4,20 +4,20 @@
 
 A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
 
-Built by analyzing official CLI v0.32.3 network traffic to accurately replicate the Command Code API request protocol.
+Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Client disconnect detection with upstream abort | Zero-output → 502 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
 ## Quick Start
 
 ```bash
-npm start        # Start (default http://0.0.0.0:3000)
+npm start        # Start (the repo ships with config.json listening on http://0.0.0.0:3050)
 npm run dev      # Watch mode (auto-reload on file changes)
 ```
 
-API Key is passed via the `Authorization` request header — **no need to store it in config files**. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
+API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
 
 ```bash
 curl http://127.0.0.1:3050/v1/chat/completions \
@@ -30,15 +30,19 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ```
 commandcode/
-├── config.json         # Port / log path etc.
-├── LICENSE             # MIT License
-├── package.json        # npm start / npm run dev
-├── proxy.mjs           # Single-file proxy core (~1600 lines)
-├── Dockerfile          # Container build (node:22-alpine)
-├── docker-compose.yml  # Container orchestration
-├── .dockerignore       # Build context exclusions
-├── README.md           # This document (English)
-└── README_zh.md        # Chinese documentation
+├── config.json           # Port / log path etc.
+├── LICENSE               # MIT License
+├── package.json          # npm start / npm run dev
+├── proxy.mjs             # Single-file proxy core (~1900 lines)
+├── Dockerfile            # Container build (node:22-alpine)
+├── docker-compose.yml    # Container orchestration
+├── .dockerignore         # Build context exclusions
+├── .github/
+│   └── workflows/
+│       └── docker-publish.yml  # GHCR multi-arch publish on v* tags
+├── captured-requests/    # Captured CLI traffic (protocol analysis reference)
+├── README.md             # This document (English)
+└── README_zh.md          # Chinese documentation
 ```
 
 ## Configuration
@@ -47,10 +51,11 @@ commandcode/
 
 | Field | Default | Description |
 |------|--------|-------------|
-| `port` | `3000` | Listen port |
+| `port` | `3000` | Listen port (repo config.json ships with `3050`) |
 | `host` | `0.0.0.0` | Listen address |
 | `apiBase` | `https://api.commandcode.ai` | CC API base URL |
 | `projectSlug` | `cc-proxy` | `x-project-slug` header |
+| `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
@@ -242,10 +247,9 @@ Health check. Returns `OK`.
 | HTTP Status | Description |
 |-------------|-------------|
 | 400 | Invalid request format |
-| 401 | API Key missing / invalid format / rejected (Key must start with `user_`) |
-| 429 | Stream idle timeout (30s streaming / 90s non-streaming, SDK auto-retry, consecutive 3: reduce context hint) |
-| 502 | Zero output tokens or CC upstream error |
-| 503 | Service temporarily unavailable |
+| 401 | API Key missing / invalid format / rejected (Key must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
+| 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
+| 502 | CC upstream error |
 
 ## Model List
 
@@ -253,16 +257,18 @@ The proxy returns a live model list via `GET /v1/models`. Below are common model
 
 ### Common Models
 
-| Model ID | Description | Features |
-|----------|-------------|----------|
-| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | Fast, general-purpose |
-| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | High-precision reasoning |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 | Long context |
-| `claude-opus-4-8` | Claude Opus 4.8 | Best reasoning |
-| `moonshotai/Kimi-K2.5` | Kimi K2.5 | Multimodal / frontend |
-| `xiaomi/mimo-v2.5` | MiMo V2.5 | **Image input supported** |
-| `Qwen/Qwen3.7-Max` | Qwen 3.7 Max | Large parameters |
-| `google/gemini-3.5-flash` | Gemini 3.5 Flash | Reasoning model |
+| Model ID | Provider |
+|----------|----------|
+| `claude-sonnet-4-6` / `claude-opus-4-8` / `claude-opus-4-7` / `claude-haiku-4-5-20251001` | Anthropic |
+| `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` | OpenAI |
+| `deepseek/deepseek-v4-pro` / `deepseek/deepseek-v4-flash` | DeepSeek |
+| `moonshotai/Kimi-K2.6` / `moonshotai/Kimi-K2.5` | Kimi |
+| `zai-org/GLM-5.1` / `zai-org/GLM-5` | GLM |
+| `MiniMaxAI/MiniMax-M3` / `MiniMaxAI/MiniMax-M2.7` / `MiniMaxAI/MiniMax-M2.5` | MiniMax |
+| `Qwen/Qwen3.7-Max` / `Qwen/Qwen3.6-Max-Preview` / `Qwen/Qwen3.6-Plus` | Qwen |
+| `stepfun/Step-3.7-Flash` / `stepfun/Step-3.5-Flash` | Step |
+| `xiaomi/mimo-v2.5-pro` / `xiaomi/mimo-v2.5` | Xiaomi (**image input supported**) |
+| `google/gemini-3.5-flash` / `google/gemini-3.1-flash-lite` | Gemini |
 
 > ⚠️ Some models (e.g. `deepseek-v4-flash`, `claude-sonnet-4-6`) do not support image input. Use `xiaomi/mimo-v2.5`, `Kimi-K2.5`, or other vision models for multimodal.
 
@@ -321,6 +327,8 @@ message = client.messages.create(
 print(message.content[0].text)
 ```
 
+The Anthropic SDK authenticates via the `x-api-key` header — supported by the proxy natively (no `Authorization` header needed).
+
 ### OpenCode
 ```json
 {
@@ -332,21 +340,23 @@ print(message.content[0].text)
 
 ## Anti-Detection
 
-Based on analysis of official CLI v0.32.3 traffic:
+Based on analysis of official CLI traffic (version auto-fetched from npm registry):
 
 | Mechanism | Implementation |
 |-----------|---------------|
+| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
+| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
 | **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
-| **CLI Envelope** | config/memory/taste/permissionMode/params/threadId |
+| **CLI Envelope** | config/memory/taste/skills/permissionMode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production` |
-| **Project Slug** | Custom `x-project-slug` |
+| **Environment** | `x-cli-environment: production`, `x-co-flag: "false"`, `x-taste-learning: "false"` |
+| **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
-| **Key Validation** | Regex `user_[a-zA-Z0-9_-]+`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
+| **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
-| **Zero-Output Guard** | outputTokens=0 → 502 error (SDK auto-retry, anti false billing) |
+| **Zero-Output Guard** | outputTokens=0 → 429 `rate_limit_error` (SDK auto-retry, anti false billing) |
 | **Upstream Abort** | `AbortController` on client disconnect + all error paths |
 | **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
 
@@ -367,8 +377,8 @@ Based on analysis of official CLI v0.32.3 traffic:
     "gitStatus": "",
     "recentCommits": []
   },
-  "memory": "",
-  "taste": "",
+  "memory": null,
+  "taste": null,
   "skills": "",
   "permissionMode": "standard",
   "params": {
@@ -377,10 +387,11 @@ Based on analysis of official CLI v0.32.3 traffic:
     "max_tokens": 64000,
     "stream": true,
     "reasoning_effort": "max"
-  },
-  "threadId": "<uuid>"
+  }
 }
 ```
+
+Conditional fields: `system` (extracted from `system` messages), `temperature`, `reasoning_effort`, `tools` (mapped to CC `input_schema` format).
 
 ### CC API Image Message Format
 
@@ -399,6 +410,17 @@ The CLI sends images in this format:
 The proxy receives OpenAI `image_url` format and converts it to the above CC format transparently.
 
 ## Docker Deployment
+
+### Pull from GHCR
+
+Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry automatically on every `v*` tag via GitHub Actions:
+
+```bash
+docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+```
+
+The `latest` tag is updated on each release. The image is public — no login required to pull.
 
 ### Quick Start (docker compose)
 
@@ -438,7 +460,7 @@ This project is for **educational and research purposes** only.
 
 - **Unofficial**: This project is not affiliated with Command Code in any way.
 - **Personal Use**: Users assume all responsibility. Please comply with the [Command Code Terms of Service](https://commandcode.ai/tos).
-- **API Key**: This project does not collect, upload, or leak your API Key. The key must be sent in every request via the `Authorization: Bearer <key>` header and is never stored in configuration.
+- **API Key**: This project does not collect, upload, or leak your API Key. The key is sent per request via the `Authorization: Bearer <key>` or `x-api-key` header and is never logged; an optional `apiKey` field in `config.json` serves only as a local fallback and never leaves your machine.
 - **Compliance**: The protocol is based on passive observation of local CLI network traffic. No unauthorized access, cracking, or tampering of the server has been performed.
 - **Account Risk**: Keep usage frequency consistent with normal CLI usage. Extremely high concurrent calls may trigger risk controls.
 
