@@ -760,19 +760,31 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
+    let settled = false;
     req.on('data', c => {
+      if (settled) return; // 超限拒绝后仅排空剩余数据，不再累积内存
       totalSize += c.length;
       if (totalSize > MAX_BODY_SIZE) {
-        req.destroy(new Error('Request body too large'));
-        reject(new Error('Request body exceeds 10MB limit'));
+        settled = true;
+        chunks.length = 0;
+        // 不调用 req.destroy()：直接断 TCP 会让客户端只看到 Connection reset，
+        // 无法区分「请求体过大」和「网络故障」，还会无意义重试（issue #7）。
+        // 改为排空剩余请求体，保持 socket 可写，让上层能返回 HTTP 413。
+        req.resume();
+        const err = new Error('Request body exceeds 10MB limit');
+        err.statusCode = 413;
+        reject(err);
+        return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
       try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
       catch { reject(new Error('Invalid JSON')); }
     });
-    req.on('error', reject);
+    req.on('error', e => { if (!settled) { settled = true; reject(e); } });
   });
 }
 
@@ -834,7 +846,11 @@ async function handleChatCompletions(req, res) {
   let openaiReq;
   try {
     openaiReq = await readBody(req);
-  } catch {
+  } catch (e) {
+    if (e.statusCode === 413) {
+      sendJSON(res, 413, { error: { message: e.message, type: 'invalid_request_error' } });
+      return;
+    }
     sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
     return;
   }
@@ -1604,7 +1620,11 @@ async function handleMessages(req, res) {
   let anthropicReq;
   try {
     anthropicReq = await readBody(req);
-  } catch {
+  } catch (e) {
+    if (e.statusCode === 413) {
+      sendAnthropicError(res, 413, 'invalid_request_error', e.message);
+      return;
+    }
     sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
     return;
   }
