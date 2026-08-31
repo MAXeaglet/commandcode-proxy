@@ -140,7 +140,11 @@ async function refreshCCVersion() {
 refreshCCVersion(); // 启动时立即拉取
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
+// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
+const MAX_BODY_SIZE = (() => {
+  const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
+  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
+})();
 const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
 const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
 
@@ -761,17 +765,22 @@ function readBody(req) {
     const chunks = [];
     let totalSize = 0;
     let settled = false;
+    let drained = 0;
+    // 413 拒绝后转入排空模式：继续读取并丢弃剩余请求体，保持 keep-alive 连接可复用，
+    // 让客户端明确收到 413 而不是 Connection reset（issue #7）。
+    // 但若客户端无视 413 持续上传超过 DRAIN_LIMIT，则强制掐断，不无限吞带宽。
+    const DRAIN_LIMIT = 32 * 1024 * 1024;
     req.on('data', c => {
-      if (settled) return; // 超限拒绝后仅排空剩余数据，不再累积内存
+      if (settled) {
+        drained += c.length;
+        if (drained > DRAIN_LIMIT) { try { req.destroy(); } catch {} }
+        return;
+      }
       totalSize += c.length;
       if (totalSize > MAX_BODY_SIZE) {
         settled = true;
         chunks.length = 0;
-        // 不调用 req.destroy()：直接断 TCP 会让客户端只看到 Connection reset，
-        // 无法区分「请求体过大」和「网络故障」，还会无意义重试（issue #7）。
-        // 改为排空剩余请求体，保持 socket 可写，让上层能返回 HTTP 413。
-        req.resume();
-        const err = new Error('Request body exceeds 10MB limit');
+        const err = new Error(`Request body exceeds ${Math.round(MAX_BODY_SIZE / 1024 / 1024)}MB limit`);
         err.statusCode = 413;
         reject(err);
         return;
