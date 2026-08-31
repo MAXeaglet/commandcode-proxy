@@ -381,11 +381,37 @@ function getEnvironment() {
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
-  // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
+  // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示（#6）
+  // 数组型 content 需展开取 text，否则会退化成 "[object Object]"（#5）
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
-  const systemPrompt = systemMsgs.map(m =>
-    typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
-  ).join('\n');
+  // 检测 system 是否带有 cache_control（Array content with cache_control）
+  let systemHasCache = false;
+  for (const m of systemMsgs) {
+    if (Array.isArray(m.content) && m.content.some(c => c && c.cache_control)) { systemHasCache = true; break; }
+  }
+  let systemPrompt = null;
+  if (systemHasCache) {
+    const blocks = [];
+    for (const m of systemMsgs) {
+      if (Array.isArray(m.content)) {
+        for (const c of m.content) {
+          const block = { type: 'text', text: c.text || c.content || '' };
+          if (c.cache_control) block.cache_control = c.cache_control;
+          blocks.push(block);
+        }
+      } else if (typeof m.content === 'string') {
+        blocks.push({ type: 'text', text: m.content });
+      }
+    }
+    systemPrompt = blocks;
+  } else {
+    systemPrompt = systemMsgs.map(m => {
+      if (typeof m.content === 'string') return m.content;
+      if (Array.isArray(m.content)) return m.content.map(c => c.text || c.content || '').join('\n');
+      return String(m.content || '');
+    }).join('\n');
+    if (!systemPrompt) systemPrompt = null;
+  }
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
@@ -400,20 +426,30 @@ function buildCcRequest(openaiReq) {
     }
   }
 
-  // 转换 messages 为 CC 格式
+  // 转换 messages 为 CC 格式 — 保留 cache_control 以启用 prompt caching
   const ccMessages = chatMessages.map(msg => {
     if (msg.role === 'user') {
       if (typeof msg.content === 'string') {
-        return { role: 'user', content: [{ type: 'text', text: msg.content }] };
+        const block = { type: 'text', text: msg.content };
+        if (msg.cache_control) block.cache_control = msg.cache_control;
+        return { role: 'user', content: [block] };
       }
-      // 多模态：数组 content 原样透传（text + image_url → CC image 格式）
+      // 多模态：数组 content 原样透传（text + image_url → CC image 格式），保留 cache_control
       if (Array.isArray(msg.content)) {
         const parts = msg.content.map(part => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
-            return { type: 'image', image: url };
+            const img = { type: 'image', image: url };
+            if (part.cache_control) img.cache_control = part.cache_control;
+            return img;
           }
+          if (part.type === 'text') {
+            const t = { type: 'text', text: part.text || part.content || '' };
+            if (part.cache_control) t.cache_control = part.cache_control;
+            return t;
+          }
+          // 透传其他类型并保留 cache_control
+          if (part.cache_control) return { ...part };
           return part;
         }).filter(Boolean);
         return { role: 'user', content: parts };
@@ -423,10 +459,16 @@ function buildCcRequest(openaiReq) {
     if (msg.role === 'assistant') {
       const parts = [];
       if (msg.content && typeof msg.content === 'string') {
-        parts.push({ type: 'text', text: msg.content });
+        const block = { type: 'text', text: msg.content };
+        if (msg.cache_control) block.cache_control = msg.cache_control;
+        parts.push(block);
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
-          if (part.type === 'text') parts.push(part);
+          if (part.type === 'text') {
+            const t = { type: 'text', text: part.text || '' };
+            if (part.cache_control) t.cache_control = part.cache_control;
+            parts.push(t);
+          }
         }
       }
       if (msg.tool_calls) {
@@ -501,12 +543,16 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
-    body.params.tools = tools.map(t => ({
-      type: t.type || 'function',
-      name: t.function?.name || t.name || '',
-      description: t.function?.description || t.description || '',
-      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
-    }));
+    body.params.tools = tools.map(t => {
+      const tool = {
+        type: t.type || 'function',
+        name: t.function?.name || t.name || '',
+        description: t.function?.description || t.description || '',
+        input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
+      };
+      if (t.cache_control) tool.cache_control = t.cache_control;
+      return tool;
+    });
   }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
@@ -1241,16 +1287,25 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
 }
 
 function convertAnthropicToOpenAI(anthropicReq) {
-  // 1. Extract system prompt (top-level, not in messages array)
-  let systemPrompt = '';
+  // 1. Extract system prompt (top-level, not in messages array) — keep cache_control blocks
+  let systemContent = null;
   if (anthropicReq.system) {
     if (typeof anthropicReq.system === 'string') {
-      systemPrompt = anthropicReq.system;
+      systemContent = anthropicReq.system;
     } else if (Array.isArray(anthropicReq.system)) {
-      systemPrompt = anthropicReq.system
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
+      const hasCache = anthropicReq.system.some(b => b && b.cache_control);
+      if (hasCache) {
+        systemContent = anthropicReq.system.map(b => {
+          const block = { type: 'text', text: b.text || '' };
+          if (b.cache_control) block.cache_control = b.cache_control;
+          return block;
+        });
+      } else {
+        systemContent = anthropicReq.system
+          .filter(b => b.type === 'text')
+          .map(b => b.text)
+          .join('\n');
+      }
     }
   }
 
@@ -1258,8 +1313,8 @@ function convertAnthropicToOpenAI(anthropicReq) {
   const toolNameFromId = {};
   const openaiMessages = [];
 
-  if (systemPrompt) {
-    openaiMessages.push({ role: 'system', content: systemPrompt });
+  if (systemContent !== null && systemContent !== '') {
+    openaiMessages.push({ role: 'system', content: systemContent });
   }
 
   const messages = anthropicReq.messages || [];
@@ -1295,13 +1350,26 @@ function convertAnthropicToOpenAI(anthropicReq) {
         for (const block of msg.content) {
           if (block.type === 'text') {
             textContent += block.text || '';
+            if (block.cache_control) textHasCache = block;
           } else if (block.type === 'tool_result') {
             toolResults.push(block);
           }
         }
       }
       if (textContent) {
-        openaiMessages.push({ role: 'user', content: textContent });
+        // CC 需按 content 数组透传 cache_control，仅当真正带有标记时
+        if (Array.isArray(msg.content) && msg.content.some(b => b && b.cache_control)) {
+          const blocks = msg.content.filter(b => b.type === 'text').map(b => {
+            const tb = { type: 'text', text: b.text || '' };
+            if (b.cache_control) tb.cache_control = b.cache_control;
+            return tb;
+          });
+          openaiMessages.push({ role: 'user', content: blocks });
+        } else {
+          const userMsg = { role: 'user', content: textContent };
+          if (msg.cache_control) userMsg.cache_control = msg.cache_control;
+          openaiMessages.push(userMsg);
+        }
       }
       for (const tr of toolResults) {
         const toolContent = typeof tr.content === 'string' ? tr.content
@@ -1325,16 +1393,20 @@ function convertAnthropicToOpenAI(anthropicReq) {
     stream: anthropicReq.stream === true,
   };
 
-  // 4. Map tools
+  // 4. Map tools — keep cache_control for prompt caching
   if (anthropicReq.tools && anthropicReq.tools.length > 0) {
-    openaiReq.tools = anthropicReq.tools.map(t => ({
-      type: 'function',
-      function: {
-        name: t.name,
-        description: t.description || '',
-        parameters: t.input_schema || { type: 'object', properties: {} },
-      },
-    }));
+    openaiReq.tools = anthropicReq.tools.map(t => {
+      const tool = {
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description || '',
+          parameters: t.input_schema || { type: 'object', properties: {} },
+        },
+      };
+      if (t.cache_control) tool.cache_control = t.cache_control;
+      return tool;
+    });
   }
 
   // 5. Map tool_choice
