@@ -195,11 +195,13 @@ setInterval(() => {
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
 }, 60 * 60 * 1000); // 每小时
 
-function getSessionId(incomingHeaders, apiKey) {
+function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
+    incomingHeaders['session_id'],
+    promptCacheKey,
   ];
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
@@ -365,7 +367,7 @@ function getEnvironment() {
 // ── CC 请求体构建 ─────────────────────────────────
 
 function buildCcRequest(openaiReq) {
-  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
+  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
@@ -441,6 +443,14 @@ function buildCcRequest(openaiReq) {
     // 未知 role 兜底：归一化为 user 并保证 content 为数组，避免 CC 校验拒绝
     return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
+
+  const hasMessageCacheMarker = ccMessages.some(msg =>
+    Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
+  if (prompt_cache_key && !hasMessageCacheMarker) {
+    const firstUserMessage = ccMessages.find(msg => msg.role === 'user' && Array.isArray(msg.content));
+    const cacheBoundary = firstUserMessage?.content.findLast(part => part?.type === 'text');
+    if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
+  }
 
   const threadId = newThreadId();
 
@@ -766,10 +776,10 @@ function getApiKey(headers) {
 
 // ── 流式转发 ────────────────────────────────────────
 
-async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
+async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey);
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -829,7 +839,7 @@ async function handleChatCompletions(req, res) {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
