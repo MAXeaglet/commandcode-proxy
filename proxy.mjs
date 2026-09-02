@@ -42,7 +42,7 @@ function loadConfig() {
   if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
-  if (process.env.CC_ZDR) defaults.zdr = process.env.CC_ZDR === '1' || process.env.CC_ZDR === 'true';
+  if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
 
   return defaults;
 }
@@ -246,6 +246,7 @@ async function ensureInitialized(apiKey, signal) {
       'x-cli-environment': 'production',
       'Authorization': `Bearer ${apiKey}`,
       'x-command-code-version': CC_VERSION,
+      ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
     };
     const fingerprint = state.fingerprint || {};
 
@@ -770,7 +771,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
     'x-project-slug': fakeProjectSlug(sessionId),
     'traceparent': traceparent,
   };
-  
+
   if (CFG.zdr || incomingHeaders['x-cmd-zdr'] === '1') {
     headers['x-cmd-zdr'] = '1';
   }
@@ -1940,7 +1941,7 @@ server.listen(CFG.port, CFG.host, () => {
     api: CFG.apiBase,
     models: MODELS.length,
     session: '12h + 1h jitter, per API key',
-    zdr: CFG.zdr ? 'enforced (x-cmd-zdr: 1)' : 'off (CC_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
+    zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     logFile: CFG.logFile || '(console only)',
   });
   if (!CFG.apiKey) {

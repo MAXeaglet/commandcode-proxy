@@ -60,7 +60,7 @@ commandcode/
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
-| `zdr` | `false` | Force zero data retention: send `x-cmd-zdr: 1` on every upstream request |
+| `zdr` | `false` | Request ZDR-only routing from Command Code |
 
 ### Environment Variables
 
@@ -72,7 +72,13 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
-| `CC_ZDR` | `zdr` (`1`/`true` to enable) |
+| `CMD_ZDR` | `zdr` (`1` to enable) |
+
+When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
+and the fingerprint/lifecycle initialization requests. It does not add the header
+to the npm version check or the proxy's `/provider/v1/models` catalog request.
+This requests Command Code's ZDR-only routing; the upstream service remains the
+authority for actual retention and provider availability.
 
 ## API Endpoints
 
