@@ -140,7 +140,11 @@ async function refreshCCVersion() {
 refreshCCVersion(); // 启动时立即拉取
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
+// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
+const MAX_BODY_SIZE = (() => {
+  const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
+  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
+})();
 const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
 const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
 
@@ -335,8 +339,19 @@ const MODELS = [
 function fakeProjectSlug(sessionId) {
   const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
     'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
-  const name = names[parseInt(sessionId.slice(0, 4), 16) % names.length];
-  const suffix = sessionId.slice(0, 4);
+  const id = String(sessionId || '');
+  const head = id.slice(0, 4);
+  // sessionId 既可能是随机 UUID（前 4 位十六进制），也可能是客户端自定义的
+  // prompt_cache_key（如 "my-stable-cache-key-001"）。后者按 16 进制解析得 NaN，
+  // 会让 slug 变成 "…-undefined-my-s"。失败时退化为确定性字符哈希。
+  let idx = parseInt(head, 16);
+  if (!Number.isFinite(idx)) {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    idx = h;
+  }
+  const name = names[idx % names.length];
+  const suffix = head || '0000';
   // 模拟一个类似 C:\Users\dev\projects\{name}-{suffix} 的路径
   const path = `C:\\Users\\dev\\projects\\${name}-${suffix}`;
   return path
@@ -370,10 +385,16 @@ function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
   // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
+  // 数组型 content 必须展开取 text 后拼成「字符串」，而不是转成 JSON 字符串，
+  // 更不能输出 Anthropic 风格的 content 块数组：CC 上游要求 params.system 恒为
+  // 字符串，传数组会被直接拒绝（真机验证：
+  // Validation error: Invalid input: expected string, received array at "params.system"）。
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
-  const systemPrompt = systemMsgs.map(m =>
-    typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
-  ).join('\n');
+  const systemPrompt = systemMsgs.map(m => {
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) return m.content.map(c => c?.text ?? c?.content ?? '').join('\n');
+    return m.content == null ? '' : String(m.content);
+  }).join('\n');
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
@@ -724,6 +745,15 @@ function mapCcEventError(event) {
   const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
+  // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
+  // 否则客户端 SDK 拿不到退避提示（402 也映射成 429，一视同仁）
+  if (mapped.status === 429) {
+    return {
+      status: 429,
+      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+    };
+  }
+
   return { status: mapped.status, body: { error: { message, type: mapped.type } } };
 }
 
@@ -733,19 +763,37 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
+    let settled = false;
+    let drained = 0;
+    // 413 拒绝后转入排空模式：继续读取并丢弃剩余请求体，保持 keep-alive 连接可复用，
+    // 让客户端明确收到 413 而不是 Connection reset（issue #7）。
+    // 但若客户端无视 413 持续上传超过 DRAIN_LIMIT，则强制掐断，不无限吞带宽。
+    const DRAIN_LIMIT = 32 * 1024 * 1024;
     req.on('data', c => {
+      if (settled) {
+        drained += c.length;
+        if (drained > DRAIN_LIMIT) { try { req.destroy(); } catch {} }
+        return;
+      }
       totalSize += c.length;
       if (totalSize > MAX_BODY_SIZE) {
-        req.destroy(new Error('Request body too large'));
-        reject(new Error('Request body exceeds 10MB limit'));
+        settled = true;
+        chunks.length = 0;
+        const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
+        const err = new Error(`Request body exceeds ${mb}MB limit`);
+        err.statusCode = 413;
+        reject(err);
+        return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
       try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
       catch { reject(new Error('Invalid JSON')); }
     });
-    req.on('error', reject);
+    req.on('error', e => { if (!settled) { settled = true; reject(e); } });
   });
 }
 
@@ -807,7 +855,11 @@ async function handleChatCompletions(req, res) {
   let openaiReq;
   try {
     openaiReq = await readBody(req);
-  } catch {
+  } catch (e) {
+    if (e.statusCode === 413) {
+      sendJSON(res, 413, { error: { message: e.message, type: 'invalid_request_error' } });
+      return;
+    }
     sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
     return;
   }
@@ -1574,7 +1626,11 @@ async function handleMessages(req, res) {
   let anthropicReq;
   try {
     anthropicReq = await readBody(req);
-  } catch {
+  } catch (e) {
+    if (e.statusCode === 413) {
+      sendAnthropicError(res, 413, 'invalid_request_error', e.message);
+      return;
+    }
     sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
     return;
   }
