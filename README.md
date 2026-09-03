@@ -60,6 +60,7 @@ commandcode/
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
+| `zdr` | `false` | Request ZDR-only routing from Command Code |
 
 ### Environment Variables
 
@@ -71,6 +72,13 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CMD_ZDR` | `zdr` (`1` to enable) |
+
+When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
+and the fingerprint/lifecycle initialization requests. It does not add the header
+to the npm version check or the proxy's `/provider/v1/models` catalog request.
+This requests Command Code's ZDR-only routing; the upstream service remains the
+authority for actual retention and provider availability.
 
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 

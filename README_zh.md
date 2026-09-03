@@ -60,6 +60,7 @@ commandcode/
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
+| `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
 
 ### 环境变量
 
@@ -71,6 +72,11 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CMD_ZDR` | `zdr`（`1` 开启） |
+
+开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
+`x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
+header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数据留存和上游可用性仍由上游服务决定。
 
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
