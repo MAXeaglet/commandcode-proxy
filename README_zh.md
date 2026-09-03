@@ -73,6 +73,7 @@ commandcode/
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CMD_ZDR` | `zdr`（`1` 开启） |
+| `CC_API_KEY` | `apiKey`（亦支持 `COMMAND_CODE_API_KEY`） |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
