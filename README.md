@@ -73,6 +73,7 @@ commandcode/
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
+| `CC_API_KEY` | `apiKey` (also accepts `COMMAND_CODE_API_KEY`) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
