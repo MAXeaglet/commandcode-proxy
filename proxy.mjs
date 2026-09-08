@@ -23,6 +23,7 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
+    emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -43,6 +44,7 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
+  if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
 
   return defaults;
 }
@@ -505,6 +507,14 @@ function buildCcRequest(openaiReq) {
   // 条件字段
   if (systemPrompt) {
     body.params.system = systemPrompt;
+  } else if (CFG.emptySystemPlaceholder) {
+    // CC 上游在 params.system 缺省时会注入自身约 7.5K token 的默认提示词（进入
+    // 默认上下文/前缀路径），既产生大量 cached tokens 又污染对话（模型会以为
+    // 自己在 CC 的可执行目录里，见 issue #17）。发一个空格占位即可绕过，
+    // 真机验证 prompt_tokens 从 7653 降到 85。
+    // 默认开启；config.json 设 "emptySystemPlaceholder": false 或环境变量
+    // CC_EMPTY_SYSTEM_PLACEHOLDER=false 可关闭（回到原生的缺省行为）。
+    body.params.system = ' ';
   }
   if (temperature !== undefined) {
     body.params.temperature = temperature;
@@ -1267,10 +1277,13 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
     stop_sequence: null,
     usage: (() => {
       normalizeUsage(usage || {});
+      // CC 未回报 usage 时按内容长度估算输出 token，避免客户端展示/记账为 0
+      const estOut = Math.max(1,
+        Math.ceil(((fullText || '').length + (thinkingText || '').length) / 4) + (toolCalls ? toolCalls.length * 20 : 0));
       return {
         input_tokens: usage?.inputTokens ?? 0,
-        output_tokens: usage?.outputTokens ?? 0,
-        cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? null,
+        output_tokens: usage?.outputTokens || estOut,
+        cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? 0,
         cache_read_input_tokens: usage?.cachedInputTokens ?? 0,
       };
     })(),
@@ -1338,18 +1351,22 @@ function convertAnthropicToOpenAI(anthropicReq) {
         }
       }
       if (textContent) {
-        openaiMessages.push({ role: 'user', content: textContent });
+        // 暂存，tool_result 优先入队：OpenAI 语义要求 tool 消息紧跟 assistant 的
+        // tool_calls，同一条 user 消息里的文本要排在 tool 结果之后
       }
       for (const tr of toolResults) {
         const toolContent = typeof tr.content === 'string' ? tr.content
           : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('')
           : String(tr.content || '');
-        openaiMessages.push({
-          role: 'tool',
-          tool_call_id: tr.tool_use_id,
-          name: toolNameFromId[tr.tool_use_id] || '',
-          content: toolContent,
-        });
+        // OpenAI 语义里 tool 消息的 name 是可选的；会话恢复等场景下 tool_use_id 可能
+        // 找不到对应 assistant tool_use（历史被客户端裁剪），此时不硬塞空 name，
+        // 避免 CC 上游报 "Tool result is missing"（issue #15）
+        const toolMsg = { role: 'tool', tool_call_id: tr.tool_use_id, content: toolContent };
+        if (toolNameFromId[tr.tool_use_id]) toolMsg.name = toolNameFromId[tr.tool_use_id];
+        openaiMessages.push(toolMsg);
+      }
+      if (textContent) {
+        openaiMessages.push({ role: 'user', content: textContent });
       }
     }
   }
@@ -1566,15 +1583,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
               ctx.inputTokens = inputTokens;
               ctx.outputTokens = outputTokens;
               ctx.cachedInputTokens = cachedInputTokens;
-            } else {
-              inputTokens = 0;
-              outputTokens = 0;
-              cachedInputTokens = 0;
-              cacheWriteTokens = 0;
-              ctx.inputTokens = 0;
-              ctx.outputTokens = 0;
-              ctx.cachedInputTokens = 0;
             }
+            // 上游未回报 usage 时保留本地按 delta 计数的估算值——清零会把有内容的
+            // 响应误判成零输出（触发 429）。未知字段保持原值即可。
             break;
           }
 
@@ -1596,6 +1607,12 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       }
     }
 
+    // 无论上游是否回报 usage，都把本地计数同步进 ctx（零输出判定与 message_delta 账单依赖它）
+    ctx.inputTokens = inputTokens;
+    ctx.outputTokens = outputTokens;
+    ctx.cachedInputTokens = cachedInputTokens;
+    ctx.cacheWriteTokens = cacheWriteTokens;
+
     // Finalize — close pending text block, emit message_delta + message_stop
     if (!hasError) {
       const closeBlock = closeTextBlock();
@@ -1608,7 +1625,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
         yield `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn' },
-          usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || null, input_tokens: inputTokens },
+          usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || 0, input_tokens: inputTokens },
         })}\n\n`;
 
         yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
@@ -1705,8 +1722,36 @@ async function handleMessages(req, res) {
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
-      let started = false; // 延迟写 200 header，超时/output=0 时返回 JSON 429/502 让 SDK 自动重试
+      // 行为与 /v1/chat/completions 对齐：首个上游事件（thinking/text/tool_use）到达即
+      // 发 header——之前扣到 text_delta 才发，推理模型 thinking 阶段客户端收不到任何
+      // 字节，触发下游 60s 首字节超时（context canceled）。message_start 仍缓冲：
+      // 完全无输出时还能回 JSON 429/502 让 SDK 自动重试（同 chat 端点）。
+      let started = false;
       const buf = [];
+      const SSE_HEADERS = {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      };
+      const flushBuf = () => {
+        if (!started) {
+          res.writeHead(200, SSE_HEADERS);
+          started = true;
+        }
+        for (const ev of buf) { try { res.write(ev); } catch {} }
+        buf.length = 0;
+      };
+
+      // 心跳：等价于 chat 端点的 ': keepalive'——chat 在每轮读到静默事件时发注释行，
+      // Anthropic 翻译器会吞掉 signal 事件，这里改用空闲计时发 ping（Anthropic 标准
+      // 事件，官方 SDK 会忽略），覆盖上游排队/长 thinking 的静默窗口
+      let lastSentAt = Date.now();
+      const heartbeat = setInterval(() => {
+        if (started && !aborted && !res.writableEnded && Date.now() - lastSentAt > 15000) {
+          try { res.write('event: ping\ndata: {"type":"ping"}\n\n'); lastSentAt = Date.now(); } catch {}
+        }
+      }, 5000);
 
       let ctx;
       try {
@@ -1715,22 +1760,14 @@ async function handleMessages(req, res) {
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
-          if (!started) {
-            buf.push(event);
-            // 确认有真实内容后才发 200 header
-            if (event.includes('"text_delta"') || event.includes('"tool_use"')) {
-              res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-              });
-              started = true;
-              for (const ev of buf) res.write(ev);
-              buf.length = 0;
-            }
+          if (!started && !event.startsWith('event: message_start')) {
+            flushBuf();
+          }
+          if (started) {
+            try { res.write(event); } catch {}
+            lastSentAt = Date.now();
           } else {
-            res.write(event);
+            buf.push(event);
           }
         }
 
@@ -1745,26 +1782,16 @@ async function handleMessages(req, res) {
                 ctx.upstreamError.body.error.message,
               );
             }
+            // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
           } else if (ctx.outputTokens === 0) {
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
               return;
             }
-            for (const ev of buf) { try { res.write(ev); } catch {} }
-            buf.length = 0;
+            flushBuf();
           } else {
-            if (!started) {
-              res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-              });
-              started = true;
-            }
-            for (const ev of buf) res.write(ev);
-            buf.length = 0;
+            flushBuf();
           }
         }
       } catch (e) {
@@ -1814,6 +1841,8 @@ async function handleMessages(req, res) {
             } catch {}
           }
         }
+      } finally {
+        clearInterval(heartbeat);
       }
 
       if (!res.writableEnded) res.end();
@@ -1855,7 +1884,7 @@ async function handleMessages(req, res) {
               case 'finish':
                 lastCcEvent = event.type;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
-                if (event.totalUsage) usage = event.totalUsage;
+                if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
                 break;
               case 'error':
                 lastCcEvent = event.type;
@@ -1893,8 +1922,9 @@ async function handleMessages(req, res) {
         return;
       }
 
-      // 输出 token 为 0 时记为错误，避免下游异常计费
-      if ((usage?.outputTokens ?? 0) === 0) {
+      // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
+      // 会把有完整文本的响应误杀成 429
+      if (!fullText && !thinkingText && !toolCalls) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
         return;
@@ -2052,6 +2082,7 @@ server.listen(CFG.port, CFG.host, () => {
     models: MODELS.length,
     session: '12h + 1h jitter, per API key',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
+    emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
   });
   if (!CFG.apiKey) {
