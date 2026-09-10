@@ -74,6 +74,7 @@ commandcode/
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_STREAM_IDLE_MS` | 流式上游读空闲超时（默认 `30000`）|
 | `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
+| `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
@@ -469,6 +470,24 @@ npm run docker:build:multi
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
+| `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限返回 `503` + `Retry-After`，见[在途上限](#在途请求上限可选) |
+
+## 在途请求上限（可选）
+
+**默认关闭**（`CC_MAX_INFLIGHT` 未设置 = 不限制并发），既有行为不变。
+
+本项目定位是**纯反代层**，并发控制属于下游 —— 按 IP / 按 key 的限流请用反向代理（见[内存与部署](#内存与部署)里的 `limit_conn`）。
+本项**不是**那套方案的替代品，只为「不挂反代裸跑」（Dockerfile 与 `npm start` 都支持这种用法）提供一个**进程内、仅全局**的兜底：
+
+```bash
+CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
+```
+
+超限时快速返回 `503` + `Retry-After: 5` + `type: server_busy` —— OpenAI / Anthropic 官方 SDK 认得这个组合会自动退避重试，而不是拿到连接被重置。`/health` 与 `/` 不计入、也不受限制，避免探活与编排器因业务繁忙收到 503。
+
+**为什么需要它**：内存 = `在途数 × (0.13MB + 5.5 × body_MB)`。`CC_MAX_BODY_MB` 只管住**单请求**量级，乘数无人管 —— 默认 100MB 时 N 个并发最坏可达 N × 550MB。
+
+> ⚠️ 开启本项**不等于**内存安全：32 × 550MB 仍远超小机器容量。要拿到硬性上界，需**同时**下调 `CC_MAX_BODY_MB`。
 
 ## 上游空闲超时
 

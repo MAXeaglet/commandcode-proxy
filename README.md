@@ -74,6 +74,7 @@ commandcode/
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_STREAM_IDLE_MS` | Streaming upstream read idle timeout (default `30000`) |
 | `CC_NONSTREAM_IDLE_MS` | Non-streaming upstream read idle timeout (default `90000`) |
+| `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
@@ -471,6 +472,23 @@ npm run docker:build:multi
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout in ms |
+| `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503` + `Retry-After`; see [In-flight cap](#in-flight-cap-optional) |
+
+## In-flight Cap (Optional)
+
+**Off by default** (`CC_MAX_INFLIGHT` unset = no concurrency limit), so existing behaviour is unchanged.
+
+This project is a **pure proxy layer**; concurrency control belongs downstream — use your reverse proxy for per-IP / per-key limits (see the `limit_conn` block in [Memory & Deployment](#memory--deployment)). This option is **not** a replacement for that; it only covers running **without** a reverse proxy (which both the Dockerfile and `npm start` invite) with an in-process, **global-only** guard:
+
+```bash
+CC_MAX_INFLIGHT=32 npm start    # at most 32 concurrent requests
+```
+
+Over the limit it returns `503` + `Retry-After: 5` + `type: server_busy` — a shape the official OpenAI / Anthropic SDKs retry with backoff, instead of the client seeing a connection reset. `/health` and `/` are exempt so liveness probes and orchestrators never receive a 503 because business traffic is busy.
+
+**Why it exists**: memory is `in-flight × (0.13 MB + 5.5 × body_MB)`. `CC_MAX_BODY_MB` bounds only the **per-request** term; nothing bounds the multiplier — at the default 100 MB, N concurrent requests can cost N × 550 MB.
+
+> ⚠️ Enabling this is **not** the same as being memory-safe: 32 × 550 MB still exceeds a small box. For a hard bound, lower `CC_MAX_BODY_MB` **as well**.
 
 ## Upstream Idle Timeouts
 

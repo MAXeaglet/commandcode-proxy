@@ -172,6 +172,22 @@ const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
 // 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
 // 默认 0 = 禁用，保持既有行为不变：僵死客户端与「卡在工具执行的合法客户端」在协议层无法
 // 区分，而官方 CLI 对上游没有任何 idle timeout（issue #19），贸然加超时会误杀健康请求。
+// 在途请求上限（可选，默认关闭）。项目定位是纯反代层，并发控制属于下游（nginx
+// limit_conn，per-IP / per-key）；本项仅为「不挂反代裸跑」的场景提供一个可选的
+// 进程内全局兜底，不替代下游方案，也不感知客户端身份。
+// 内存 = 在途数 × (0.13MB + 5.5 × body_MB)：body 上限只管住单请求量级，乘数由本项封顶。
+// 超限返回 503 + Retry-After（SDK 会自行退避重试），而不是放任进程被 OOM 杀掉。
+// 默认 0 = 关闭，不限制并发（既有的反代层定位不变，行为零变化）；需要时按需开启：
+//   CC_MAX_INFLIGHT=32 npm start
+// 注意：body 上限只管住单请求量级，乘数由本项封顶。默认 body 上限 100MB 时，
+// N × 最坏 550MB —— 要硬性内存上界需同时下调 CC_MAX_BODY_MB。
+const MAX_INFLIGHT = (() => {
+  const n = Number.parseInt(process.env.CC_MAX_INFLIGHT ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;            // 默认 0 = 不限
+})();
+
+let inflightCount = 0;   // 当前在途请求数（不含 /health）
+
 const CLIENT_DRAIN_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_CLIENT_DRAIN_TIMEOUT_MS ?? '', 10);
   return Number.isFinite(ms) && ms > 0 ? ms : 0;
@@ -2130,6 +2146,32 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
 
+  // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
+  const isLiveness = url.pathname === '/health' || url.pathname === '/';
+  if (!isLiveness && MAX_INFLIGHT > 0) {
+    if (inflightCount >= MAX_INFLIGHT) {
+      log('warn', 'In-flight limit reached, rejecting request', {
+        maxInflight: MAX_INFLIGHT, inflight: inflightCount, path: url.pathname,
+      });
+      sendJSON(res, 503, {
+        error: { message: `Too many concurrent requests (limit ${MAX_INFLIGHT}), retry shortly`, type: 'server_busy' },
+        retry_after: 5,
+      });
+      return;
+    }
+    inflightCount++;
+    // 释放时机：响应写完（finish）或连接终止（close）—— 取先到者，且幂等，
+    // 保证任何退出路径（成功/出错/客户端断连/超时）都不会泄漏槽位。
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (inflightCount > 0) inflightCount--;
+    };
+    res.once('finish', release);
+    res.once('close', release);
+  }
+
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
@@ -2168,6 +2210,7 @@ server.listen(CFG.port, CFG.host, () => {
     logFile: CFG.logFile || '(console only)',
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
+    maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
