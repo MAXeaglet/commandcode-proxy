@@ -145,12 +145,26 @@ refreshCCVersion(); // 启动时立即拉取
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
+// ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
+//    chunks[] / Buffer.concat / utf8 字符串 / JSON.parse 对象树 / buildCcRequest 重建对象树 / JSON.stringify 序列化体。
+//    实测峰值 ≈ body 大小 × 5.1~7.4（7MB→+52MB，20MB→+116MB；而 413 拒绝路径只要 ×1.05）。
+//    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，且该上限是每请求的、不是全局的。
+//    公网/多用户部署请在反向代理层同时限制 body 大小与在途请求数（见 README「内存与部署」）。
 const MAX_BODY_SIZE = (() => {
   const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
   return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
 })();
 const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
 const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
+
+// 客户端「僵死」保护：既不读也不断开时，该请求会连带上游连接一直挂着（背压修复后的残留）。
+// 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
+// 默认 0 = 禁用，保持既有行为不变：僵死客户端与「卡在工具执行的合法客户端」在协议层无法
+// 区分，而官方 CLI 对上游没有任何 idle timeout（issue #19），贸然加超时会误杀健康请求。
+const CLIENT_DRAIN_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_CLIENT_DRAIN_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+})();
 
 // 连续超时计数：连续 3 次超时才提醒压缩上下文，任意成功请求后重置
 let consecutiveTimeouts = 0;
@@ -810,6 +824,50 @@ function readBody(req) {
   });
 }
 
+// 下游背压：res.write() 返回 false 表示 socket 写缓冲已超 highWaterMark（消费者跟不上）。
+// 忽略它会让整个上游流在内存中无界堆积 —— 客户端不读时 RSS 随上游流一起增长（issue #20）。
+// 必须同时监听 close/error，否则客户端断连会让请求协程永久挂起。
+// CLIENT_DRAIN_TIMEOUT_MS > 0 时额外加一道空闲看门狗：超时则 destroy 该响应，
+// 由此触发既有的 res 'close' 处理器 → aborted=true → 中止 CC 上游，无需改动各调用点。
+function waitDrain(res) {
+  if (!res.writableNeedDrain) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer = null;
+    const done = () => {
+      res.off('drain', done); res.off('close', done); res.off('error', done);
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolve();
+    };
+    res.once('drain', done); res.once('close', done); res.once('error', done);
+    if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
+      timer = setTimeout(() => {
+        log('warn', 'Client stalled on backpressure, dropping connection', {
+          path: res.req?.url || '(unknown)',
+          timeoutMs: CLIENT_DRAIN_TIMEOUT_MS,
+          bufferedBytes: res.writableLength,
+        });
+        try { res.destroy(); } catch {}
+        done();
+      }, CLIENT_DRAIN_TIMEOUT_MS);
+    }
+  });
+}
+
+// 上游读空闲看门狗：复用单个定时器，避免「每个 chunk 新建一个 setTimeout 且从不清理」。
+// 实测每个待触发定时器滞留约 225B；稳态滞留 = 吞吐 × 超时窗口 × 每响应 chunk 数 × 225B
+// （50 rps × 2000 chunk × 30s ≈ 644MB，非流式 90s 窗口约为其三倍）。
+// arm() 用 refresh() 把窗口重置为「本轮 read 开始」，与原实现语义一致：超时只计 reader.read() 的等待。
+function createIdleWatchdog(timeoutMs) {
+  let rejectFn = null;
+  const expired = new Promise((_, reject) => { rejectFn = reject; });
+  expired.catch(() => {}); // 读循环退出后定时器才触发时，避免 unhandledRejection
+  const timer = setTimeout(() => rejectFn(new Error('STREAM_IDLE_TIMEOUT')), timeoutMs);
+  return {
+    arm() { timer.refresh(); return expired; },
+    dispose() { clearTimeout(timer); },
+  };
+}
+
 function sendJSON(res, status, data) {
   const headers = { 'Content-Type': 'application/json' };
   if (data && data.retry_after !== undefined) {
@@ -964,22 +1022,24 @@ async function handleChatCompletions(req, res) {
       const decoder = new TextDecoder();
       reader = ccResponse.body.getReader();
 
+      const idle = createIdleWatchdog(STREAM_IDLE_TIMEOUT_MS);
       try {
         while (true) {
-          const result = await Promise.race([
-            reader.read(),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-            ),
-          ]);
+          const result = await Promise.race([reader.read(), idle.arm()]);
           const { done, value } = result;
           if (done) break;
           if (aborted) break;
           bytesReceived += value.length;
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
+          const chunkText = decoder.decode(value, { stream: true });
+          buffer += chunkText;
+          // 仅在新到数据含换行时才切分：buffer 中永不残留 '\n'，故无换行即无完整行。
+          // 避免对增长中的超长单行（大 tool-call / tool_result）反复做全量 split —— O(n²) → O(n)。
+          let lines = [];
+          if (chunkText.indexOf('\n') !== -1) {
+            lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+          }
 
           let hadOutput = false;
           for (const line of lines) {
@@ -995,12 +1055,16 @@ async function handleChatCompletions(req, res) {
                 started = true;
               }
               for (const evt of events) res.write(evt);
+              await waitDrain(res);
               hadOutput = true;
             }
             if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
           }
           // silent events 期间发 keepalive，防止客户端超时断开
-          if (started && !hadOutput) { try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {} }
+          if (started && !hadOutput) {
+            try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {}
+            await waitDrain(res);
+          }
         }
 
         if (!aborted) {
@@ -1012,6 +1076,7 @@ async function handleChatCompletions(req, res) {
             if (events) {
               if (!started) started = true;
               for (const evt of events) res.write(evt);
+              await waitDrain(res);
             }
           }
           if (translator.upstreamError) {
@@ -1084,6 +1149,8 @@ async function handleChatCompletions(req, res) {
             try { res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'proxy_error' } })}\n\n`); } catch {}
           }
         }
+      } finally {
+        idle.dispose();
       }
 
       if (!res.writableEnded) res.end();
@@ -1143,19 +1210,18 @@ async function handleChatCompletions(req, res) {
         }
       };
 
+      const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
       while (true) {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-          ),
-        ]);
+        const result = await Promise.race([reader.read(), idle.arm()]);
         const { done, value } = result;
         if (done) break;
         bytesReceived += value.length;
-        buf += decoder.decode(value, { stream: true });
-        processLines();
+        const chunkText = decoder.decode(value, { stream: true });
+        buf += chunkText;
+        // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
+        if (chunkText.indexOf('\n') !== -1) processLines();
       }
+      idle.dispose();
       processLines();
 
       if (upstreamError) {
@@ -1503,21 +1569,22 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  const idle = createIdleWatchdog(STREAM_IDLE_TIMEOUT_MS);
 
   try {
     while (true) {
-      const result = await Promise.race([
-        reader.read(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-        ),
-      ]);
+      const result = await Promise.race([reader.read(), idle.arm()]);
       const { done, value } = result;
       if (done) break;
       ctx.bytesReceived += value.length;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      const chunkText = decoder.decode(value, { stream: true });
+      buffer += chunkText;
+      // 同 handleChatCompletions：无换行即无完整行，跳过全量 split
+      let lines = [];
+      if (chunkText.indexOf('\n') !== -1) {
+        lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+      }
 
       let hadOutput = false;
       for (const line of lines) {
@@ -1633,6 +1700,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
     }
   } finally {
     // 确保流中断时通知上游
+    idle.dispose();
     try { reader.cancel(); } catch {}
   }
 }
@@ -1734,13 +1802,14 @@ async function handleMessages(req, res) {
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
       };
-      const flushBuf = () => {
+      const flushBuf = async () => {
         if (!started) {
           res.writeHead(200, SSE_HEADERS);
           started = true;
         }
         for (const ev of buf) { try { res.write(ev); } catch {} }
         buf.length = 0;
+        await waitDrain(res);
       };
 
       // 心跳：等价于 chat 端点的 ': keepalive'——chat 在每轮读到静默事件时发注释行，
@@ -1748,7 +1817,9 @@ async function handleMessages(req, res) {
       // 事件，官方 SDK 会忽略），覆盖上游排队/长 thinking 的静默窗口
       let lastSentAt = Date.now();
       const heartbeat = setInterval(() => {
-        if (started && !aborted && !res.writableEnded && Date.now() - lastSentAt > 15000) {
+        // 不向已积压的下游继续塞数据：定时器回调是同步的，无法 await waitDrain，
+        // 因此用 writableNeedDrain 直接跳过本轮心跳（背压场景下少发一个 ping 无副作用）
+        if (started && !aborted && !res.writableEnded && !res.writableNeedDrain && Date.now() - lastSentAt > 15000) {
           try { res.write('event: ping\ndata: {"type":"ping"}\n\n'); lastSentAt = Date.now(); } catch {}
         }
       }, 5000);
@@ -1761,11 +1832,12 @@ async function handleMessages(req, res) {
         for await (const event of generator) {
           if (aborted) break;
           if (!started && !event.startsWith('event: message_start')) {
-            flushBuf();
+            await flushBuf();
           }
           if (started) {
             try { res.write(event); } catch {}
             lastSentAt = Date.now();
+            await waitDrain(res);
           } else {
             buf.push(event);
           }
@@ -1789,9 +1861,9 @@ async function handleMessages(req, res) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
               return;
             }
-            flushBuf();
+            await flushBuf();
           } else {
-            flushBuf();
+            await flushBuf();
           }
         }
       } catch (e) {
@@ -1902,19 +1974,18 @@ async function handleMessages(req, res) {
         }
       };
 
+      const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
       while (true) {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-          ),
-        ]);
+        const result = await Promise.race([reader.read(), idle.arm()]);
         const { done, value } = result;
         if (done) break;
         bytesReceived += value.length;
-        buf += decoder.decode(value, { stream: true });
-        processLines();
+        const chunkText = decoder.decode(value, { stream: true });
+        buf += chunkText;
+        // 无换行则不可能产生完整行，跳过全量 split
+        if (chunkText.indexOf('\n') !== -1) processLines();
       }
+      idle.dispose();
       processLines();
 
       if (upstreamError) {
@@ -2084,7 +2155,21 @@ server.listen(CFG.port, CFG.host, () => {
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
+    clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
   });
+  if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
+    log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
+  }
+  // 内存提示：body 上限隐含的最坏内存 = 上限 × 实测放大系数（见 MAX_BODY_SIZE 注释 / issue #20）
+  const bodyCapMB = Math.round(MAX_BODY_SIZE / 1048576);
+  const worstCaseMB = Math.round(bodyCapMB * 5.5);
+  if (worstCaseMB >= 500) {
+    log('warn', 'Request body limit implies high per-request worst-case memory', {
+      maxBodyMB: bodyCapMB,
+      worstCaseRSSPerRequestMB: worstCaseMB,
+      hint: 'lower CC_MAX_BODY_MB and/or cap in-flight requests at the reverse proxy (see README)',
+    });
+  }
   if (!CFG.apiKey) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }

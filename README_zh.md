@@ -80,6 +80,8 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
+> ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
 ## API 接口
 
 ### `POST /v1/chat/completions`
@@ -462,6 +464,97 @@ npm run docker:build:multi
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
+
+## 内存与部署
+
+> 数据来自 [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) 的实测复现（Node v24，loopback mock 上游）。
+
+单请求内存开销的经验公式：
+
+```
+RSS ≈ 70 MB + 在途请求数 × (0.13 MB + 5.5 × body_MB)
+```
+
+### 流式响应已做背压
+
+`res.write()` 返回 `false`（socket 写缓冲超过 `highWaterMark`）时会暂停读取上游，响应不再在内存中无界堆积：
+
+| 场景（200MB 上游流，客户端发完请求即停止读取） | 峰值 RSS 增量 |
+|---|---|
+| 修复前 | **+586 MB**（66 → 652 MB）|
+| 修复后 | **+4 MB**（背压一路传回上游，上游只吐出 ~8MB 即停住）|
+
+这不只是恶意客户端问题 —— 弱网/移动端、客户端卡在工具执行、客户端已放弃但 TCP 还没发 RST，都会触发。
+
+### 请求体放大 ~5.5×
+
+body 在转发到上游前同时存在多份副本：`chunks[]` / `Buffer.concat` / utf8 字符串 / `JSON.parse` 对象树 / `buildCcRequest` 重建对象树 / `JSON.stringify` 序列化体。
+
+| body | 上限 | 峰值增量 | 结果 |
+|---|---|---|---|
+| 7 MB | 100 MB | +52 MB（7.4×）| 200 |
+| 20 MB | 100 MB | +116 MB（5.8×）| 200 |
+| 20 MB | 8 MB | +21 MB（1.05×）| **413** |
+
+启动时若隐含最坏峰值 ≥ 500MB，日志会输出 `warn` 提示。上限是**按请求**的，proxy 自身没有在途限流 —— 公网部署必须在反向代理层补上。
+
+### nginx 反代建议
+
+`client_max_body_size` 在 nginx 拒绝时，body 根本不会进入 Node 进程：
+
+```nginx
+map $http_authorization $cc_key { default $http_authorization; "" $http_x_api_key; }
+map "" $cc_global_key { default "global"; }
+
+limit_conn_zone $binary_remote_addr zone=cc_ip:10m;
+limit_conn_zone $cc_key             zone=cc_key:10m;
+limit_conn_zone $cc_global_key      zone=cc_global:10m;
+
+location /v1/ {
+    client_max_body_size 4m;   # 需 <= CC_MAX_BODY_MB
+    limit_conn cc_ip     8;
+    limit_conn cc_key    4;
+    limit_conn cc_global 32;   # 这一项就是内存天花板
+    limit_conn_status 429;
+    proxy_pass http://127.0.0.1:3050;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 300s;   # 需大于 30s 的流空闲超时
+}
+```
+
+### 僵死连接（既不读也不断开）
+
+背压生效后，客户端**既不读也不断开**时该请求会连带上游连接一直挂着。实测残留在途成本：
+
+| 僵死连接数 | RSS 增量 | 上游连接持有 |
+|---|---|---|
+| 1 | +5 MB | 1 |
+| 10 | +45 MB | 10 |
+| 50 | +248 MB | 50（**永久持有**）|
+
+特性是**有界、不泄漏、客户端断开即回收**（RSS 曲线完全持平），但**连接数本身无上限**。
+
+默认**不处理**，因为僵死客户端与「卡在工具执行的合法客户端」在协议层无法区分；且官方 CLI 对上游没有任何 idle timeout（见 [#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)），贸然加超时会重蹈「误杀健康请求」。
+
+需要封顶时启用（opt-in）：
+
+```bash
+# 下游持续阻塞超过 60s 才断开，正常客户端只要在推进 drain 就不会触发
+CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
+```
+
+启用后实测（50 个僵死连接）：上游连接持有数由 **50（永久）→ 0**，且丢弃后**不会**继续抽干上游。
+
+更稳妥的封顶仍在反向代理层（`limit_conn`），因为只有它知道该部署能承受多少并发。
+
+### 其它注意事项
+
+- **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
+- **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
+- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
 
 ## 免责声明
 

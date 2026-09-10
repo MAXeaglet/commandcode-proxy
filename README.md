@@ -82,6 +82,8 @@ authority for actual retention and provider availability.
 
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
+> ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
 ## API Endpoints
 
 ### `POST /v1/chat/completions`
@@ -464,6 +466,98 @@ npm run docker:build:multi
 | `PORT` | `3050` | Container listen port |
 | `PROXY_PORT` | `3050` | Host port (compose only) |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
+
+## Memory & Deployment
+
+> Measurements reproduced from [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) (Node v24, loopback mock upstream).
+
+Rule of thumb for per-request memory:
+
+```
+RSS ≈ 70 MB + in-flight × (0.13 MB + 5.5 × body_MB)
+```
+
+### Streaming responses apply backpressure
+
+When `res.write()` returns `false` (the socket write buffer passed `highWaterMark`), reading from upstream pauses, so the response no longer accumulates unbounded in memory:
+
+| Scenario (200 MB upstream stream, client stops reading after sending) | Peak RSS delta |
+|---|---|
+| Before the fix | **+586 MB** (66 → 652 MB) |
+| After the fix | **+4 MB** (backpressure propagates upstream, which stalls after ~8 MB) |
+
+This is not only a hostile-client problem — throttled/mobile links, a client blocked on tool execution, or a client that already gave up but whose TCP stack has not sent RST all trigger it.
+
+### Request body is ~5.5× its size
+
+The body exists in several copies before being forwarded: `chunks[]` / `Buffer.concat` / utf8 string / `JSON.parse` object tree / `buildCcRequest` second object tree / `JSON.stringify` serialized body.
+
+| body | cap | peak delta | status |
+|---|---|---|---|
+| 7 MB | 100 MB | +52 MB (7.4×) | 200 |
+| 20 MB | 100 MB | +116 MB (5.8×) | 200 |
+| 20 MB | 8 MB | +21 MB (1.05×) | **413** |
+
+At startup a `warn` is logged when the implied worst case is ≥ 500 MB. The limit is **per request** and the proxy does no in-flight limiting of its own — a public deployment must add both at the reverse proxy.
+
+### Suggested nginx front
+
+Rejecting in nginx means the body is never materialized in the Node process at all:
+
+```nginx
+map $http_authorization $cc_key { default $http_authorization; "" $http_x_api_key; }
+map "" $cc_global_key { default "global"; }
+
+limit_conn_zone $binary_remote_addr zone=cc_ip:10m;
+limit_conn_zone $cc_key             zone=cc_key:10m;
+limit_conn_zone $cc_global_key      zone=cc_global:10m;
+
+location /v1/ {
+    client_max_body_size 4m;   # must be <= CC_MAX_BODY_MB
+    limit_conn cc_ip     8;
+    limit_conn cc_key    4;
+    limit_conn cc_global 32;   # this *is* the memory ceiling
+    limit_conn_status 429;
+    proxy_pass http://127.0.0.1:3050;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 300s;   # must exceed the 30s stream idle timeout
+}
+```
+
+### Stalled clients (neither reading nor disconnecting)
+
+Once backpressure is in effect, a client that **neither reads nor disconnects** keeps its request and upstream connection alive indefinitely. Measured residual cost:
+
+| Stalled connections | RSS delta | Upstream connections held |
+|---|---|---|
+| 1 | +5 MB | 1 |
+| 10 | +45 MB | 10 |
+| 50 | +248 MB | 50 (**held forever**) |
+
+The cost is **bounded, does not leak, and is reclaimed as soon as the client disconnects** (the RSS curve stays flat) — but the **number of connections itself is unbounded**.
+
+This is left unhandled by default, because a stalled client is indistinguishable at the protocol level from a *legitimate* client blocked on tool execution, and the official CLI has no upstream idle timeout at all (see [#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)) — adding an aggressive timeout would repeat the mistake of killing healthy requests.
+
+To cap it, opt in:
+
+```bash
+# only drop a client that has been blocked downstream for over 60s;
+# a client that keeps making drain progress never triggers this
+CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
+```
+
+Measured with the timeout enabled (50 stalled connections): upstream connections held goes from **50 (forever) → 0**, with **no** post-drop draining of upstream.
+
+A more robust cap still belongs at the reverse proxy (`limit_conn`), since only it knows how much concurrency a given deployment can afford.
+
+### Other notes
+
+- **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
+- **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
+- **Multi-account + multiple instances**: `sessionStore` / `keyStateStore` are per-process `Map`s, so the same API key served by two instances gets two different sessions and **two different device fingerprints** — upstream sees one account on multiple machines. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
 
 ## Disclaimer
 
