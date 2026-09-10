@@ -1018,6 +1018,10 @@ async function handleChatCompletions(req, res) {
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
+  // 断开原始请求树：ccBody 建好后，整棵树只剩 prompt_cache_key 还被用到。
+  // 先取出该值再释放引用，让这份副本能被更早回收 —— 原先它与 ccBody 一起活到请求结束。
+  const promptCacheKey = openaiReq.prompt_cache_key;
+  openaiReq = null;
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   const abortController = new AbortController();
@@ -1032,7 +1036,7 @@ async function handleChatCompletions(req, res) {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -1824,8 +1828,12 @@ async function handleMessages(req, res) {
   const model = anthropicReq.model || 'claude-sonnet-4-6';
 
   // Convert Anthropic → OpenAI → CC
-  const openaiReq = convertAnthropicToOpenAI(anthropicReq);
+  let openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
+  // 断开两棵中间树：ccBody 建好后 anthropicReq / openaiReq 都不再被引用。
+  // messages 路径此前同时持有两棵树，与 ccBody 一起活到请求结束。
+  openaiReq = null;
+  anthropicReq = null;
 
   const abortController = new AbortController();
   let aborted = false;
@@ -2604,7 +2612,11 @@ async function handleResponses(req, res) {
   };
   const ccBody = buildCcRequest(chatReq);
   const promptCacheKey = chatReq.prompt_cache_key;
+  // 断开两棵请求树：ccBody 建好后，转换后的 chatReq 与原始 respReq 都不再被引用。
+  // respReq 是 Codex 送来的完整会话（input items 原始形态），比 chatReq 还大一份 ——
+  // 原先它与 ccBody 一起活到请求结束。
   chatReq = null;
+  respReq = null;
 
   const abortController = new AbortController();
   let aborted = false;
