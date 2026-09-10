@@ -72,6 +72,8 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_STREAM_IDLE_MS` | Streaming upstream read idle timeout (default `30000`) |
+| `CC_NONSTREAM_IDLE_MS` | Non-streaming upstream read idle timeout (default `90000`) |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
@@ -467,6 +469,29 @@ npm run docker:build:multi
 | `PROXY_PORT` | `3050` | Host port (compose only) |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
+| `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout in ms |
+
+## Upstream Idle Timeouts
+
+Two upstream read idle watchdogs; on expiry the proxy returns `429` (with `retry_after`) so the SDK retries automatically:
+
+| Env var | Default | Applies to |
+|---|---|---|
+| `CC_STREAM_IDLE_MS` | `30000` | Streaming requests |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming requests |
+
+**Semantics**: they measure only the time spent waiting inside `reader.read()`, reset on every received chunk — **not the total request duration**. As long as upstream keeps emitting, the watchdog never fires, even for a request that has been running for tens of minutes.
+
+**The defaults differ from the official CLI, and that is a known trade-off** ([#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)): the official CLI has **no** upstream idle timeout at all — deobfuscating `command-code@1.50.0` shows every `createApiClient({ baseUrl })` call site passes no `timeout`, and 700+ second stalls complete successfully. This proxy keeps 30 s to catch genuinely dead connections; the cost is that a reasoning model's long prefill/first-token stall can be killed.
+
+If you see `429 Response timeout` or `zero output tokens` where the log shows `elapsedMs ≈ 30000` and `bytesReceived = 0`, the watchdog killed a healthy stall — raise it:
+
+```bash
+CC_STREAM_IDLE_MS=300000 npm start      # 5 minutes
+```
+
+> ⚠️ A false kill costs more than one failed request: the abort returns `429 + retry_after`, the SDK retries automatically, and a retry **resends the entire context** — so each false kill re-pays the full prefill on long conversations.
 
 ## Memory & Deployment
 

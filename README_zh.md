@@ -72,6 +72,8 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_STREAM_IDLE_MS` | 流式上游读空闲超时（默认 `30000`）|
+| `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
@@ -465,6 +467,34 @@ npm run docker:build:multi
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
+| `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
+
+## 上游空闲超时
+
+两个上游读空闲看门狗，超时后返回 `429`（带 `retry_after`）让 SDK 自动重试：
+
+| 环境变量 | 默认 | 作用于 |
+|---|---|---|
+| `CC_STREAM_IDLE_MS` | `30000` | 流式请求 |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式请求 |
+
+**语义**：只计「`reader.read()` 的等待时间」，每收到一个 chunk 就重置 —— **不是整个请求的总时长**。
+只要上游在持续吐流就不会触发，哪怕单个请求已经跑了几十分钟。
+
+**默认值与官方 CLI 不一致，这是已知取舍**（[#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)）：
+官方 CLI 对上游**没有任何** idle timeout —— 反编译 `command-code@1.50.0` 可见所有 `createApiClient({ baseUrl })` 调用点都未传 `timeout`，实测 700+ 秒的停顿可正常完成。
+本代理保留 30s 是为了兜住真正死掉的连接；代价是**推理模型的长思考停顿可能被误杀**。
+
+若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 30000`、`bytesReceived = 0`，
+说明是看门狗误杀了 prefill / 首 token 阶段的正常停顿 —— 调大即可：
+
+```bash
+CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
+```
+
+> ⚠️ 误杀的成本不止一次失败：被 abort 后返回 `429 + retry_after`，SDK 会自动重试，
+> 而重试等于**完整重发整个上下文**，长会话下每次误杀都要重付一次全量 prefill。
 
 ## 内存与部署
 

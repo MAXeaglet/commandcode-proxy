@@ -154,8 +154,19 @@ const MAX_BODY_SIZE = (() => {
   const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
   return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
 })();
-const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
-const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
+// 上游读空闲超时（issue #19）：只计「reader.read() 的等待」，每收到一个 chunk 重置，
+// 不是整个请求的总时长。默认值保持不变（30s / 90s），可用环境变量覆盖 ——
+// 官方 CLI 对上游没有任何 idle timeout（反编译 command-code@1.50.0 已验证，
+// createApiClient 调用点均未传 timeout），合法的长思考停顿可达数百秒，
+// 遇到推理模型被 30s 误杀 / 触发 429 重试放大时，调大这两个值即可。
+const STREAM_IDLE_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_STREAM_IDLE_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 30000;   // 默认 30s — 流式无新数据中断
+})();
+const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_NONSTREAM_IDLE_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 90000;   // 默认 90s — 非流式超时更宽容
+})();
 
 // 客户端「僵死」保护：既不读也不断开时，该请求会连带上游连接一直挂着（背压修复后的残留）。
 // 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
@@ -2156,6 +2167,7 @@ server.listen(CFG.port, CFG.host, () => {
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
+    idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
