@@ -893,6 +893,45 @@ function getApiKey(headers) {
   return null;
 }
 
+
+// ── fetch 网络层指数退避重试（本地增强，上游未实现）────────────────
+const RETRYABLE_NET_CODES = new Set([
+  'ECONNRESET','ECONNREFUSED','ETIMEDOUT','EPIPE','ENOTFOUND','EAI_AGAIN',
+  'UND_ERR_SOCKET','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT',
+]);
+function isRetryableFetchError(e, signal) {
+  if (e?.name === 'AbortError') return false;          // 客户端中止/空闲掐断 → 不重试
+  if (signal?.aborted) return false;
+  const c1 = e?.cause, c2 = c1?.cause;
+  const code = c1?.code || c2?.code || '';
+  if (code && RETRYABLE_NET_CODES.has(code)) return true;
+  // 裸 TypeError 'fetch failed'（无 cause）也按网络层处理
+  return (e instanceof TypeError) && e.message === 'fetch failed';
+}
+function sleepAbortable(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+    const t = setTimeout(done, ms);
+    const onAbort = () => { clearTimeout(t); signal.removeEventListener('abort', onAbort); reject(signal.reason || new DOMException('Aborted', 'AbortError')); };
+    function done() { clearTimeout(t); signal?.removeEventListener('abort', onAbort); resolve(); }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+async function fetchWithRetry(url, options, retries = 2) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fetch(url, options);
+    } catch (e) {
+      if (attempt >= retries || !isRetryableFetchError(e, options.signal)) throw e;
+      attempt++;
+      const delayMs = 300 * (2 ** (attempt - 1));      // 第1次重试等300ms, 第2次600ms
+      log('warn', 'Upstream network retry', { attempt, cause: (e?.cause?.code || e.message), retryInMs: delayMs });
+      await sleepAbortable(delayMs, options.signal);
+    }
+  }
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -916,7 +955,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     headers['x-cmd-zdr'] = '1';
   }
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
