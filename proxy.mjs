@@ -753,6 +753,24 @@ function normalizeUsage(u) {
   }
 }
 
+// CC 的 inputTokens 是「总数」（含缓存命中部分），而 Anthropic 的 input_tokens 只计
+// 非缓存部分 —— 官方 SDK 注释：Total input tokens in a request is the summation of
+// `input_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`。
+// 直接把 CC 的 inputTokens 当 input_tokens 转发，会让下游把两者当成互不重叠的两部分，
+// 相加后约为真实输入的两倍（issue #25）。
+//
+// CC 实际已经算好：inputTokenDetails.noCacheTokens（实测 noCacheTokens + cacheReadTokens
+// === inputTokens）。优先采用该字段；缺失时回退到减法，保证老版本上游也能得到正确值。
+function anthropicInputTokens(usage, noCacheOverride) {
+  const u = usage || {};
+  if (typeof noCacheOverride === 'number' && noCacheOverride >= 0) return noCacheOverride;
+  const noCache = u.inputTokenDetails && u.inputTokenDetails.noCacheTokens;
+  if (typeof noCache === 'number' && noCache >= 0) return noCache;
+  const cacheRead = u.cachedInputTokens || (u.inputTokenDetails && u.inputTokenDetails.cacheReadTokens) || 0;
+  const cacheWrite = (u.inputTokenDetails && u.inputTokenDetails.cacheWriteTokens) || 0;
+  return Math.max(0, (u.inputTokens || 0) - cacheRead - cacheWrite);
+}
+
 function mapFinishReason(reason) {
   switch (reason) {
     case 'tool-calls': return 'tool_calls';
@@ -1384,7 +1402,8 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
       const estOut = Math.max(1,
         Math.ceil(((fullText || '').length + (thinkingText || '').length) / 4) + (toolCalls ? toolCalls.length * 20 : 0));
       return {
-        input_tokens: usage?.inputTokens ?? 0,
+        // input_tokens 只计非缓存部分（Anthropic 语义），与 cache_* 相加才等于总输入
+        input_tokens: anthropicInputTokens(usage),
         output_tokens: usage?.outputTokens || estOut,
         cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? 0,
         cache_read_input_tokens: usage?.cachedInputTokens ?? 0,
@@ -1551,6 +1570,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let outputTokens = 0;
   let cachedInputTokens = 0;
   let cacheWriteTokens = 0;
+  let noCacheTokens = -1;   // -1 = 上游未提供该字段，改用减法兜底
   let stopReason = null;
   let hasError = false;
   let currentThinkingText = ''; // accumulated thinking text for the open block
@@ -1690,6 +1710,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
               outputTokens = u.outputTokens ?? outputTokens;
               cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
               cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
+              if (typeof u.inputTokenDetails?.noCacheTokens === 'number') {
+                noCacheTokens = u.inputTokenDetails.noCacheTokens;
+              }
               ctx.inputTokens = inputTokens;
               ctx.outputTokens = outputTokens;
               ctx.cachedInputTokens = cachedInputTokens;
@@ -1717,7 +1740,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       }
     }
 
-    // 无论上游是否回报 usage，都把本地计数同步进 ctx（零输出判定与 message_delta 账单依赖它）
+    // 无论上游是否回报 usage，都把本地计数同步进 ctx（零输出判定与超时日志依赖它）。
+    // 注意：ctx.inputTokens 保存的是上游原始总数，仅供日志排查；
+    // message_delta 的 input_tokens 走 anthropicInputTokens / noCacheTokens 换算，不读它。
     ctx.inputTokens = inputTokens;
     ctx.outputTokens = outputTokens;
     ctx.cachedInputTokens = cachedInputTokens;
@@ -1735,7 +1760,15 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
         yield `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn' },
-          usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, cache_creation_input_tokens: cacheWriteTokens || 0, input_tokens: inputTokens },
+          usage: {
+            output_tokens: outputTokens,
+            cache_read_input_tokens: cachedInputTokens,
+            cache_creation_input_tokens: cacheWriteTokens || 0,
+            // 只计非缓存部分；否则下游把 input 与 cache_read 相加会得到约两倍（issue #25）
+            input_tokens: noCacheTokens >= 0
+              ? noCacheTokens
+              : Math.max(0, inputTokens - cachedInputTokens - (cacheWriteTokens || 0)),
+          },
         })}\n\n`;
 
         yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
