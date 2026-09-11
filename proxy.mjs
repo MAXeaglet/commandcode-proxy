@@ -477,11 +477,21 @@ function buildCcRequest(openaiReq) {
     }
     if (msg.role === 'assistant') {
       const parts = [];
+      // 思考内容必须回传：CC 在 thinking 模式下校验 reasoning 是否随历史带回，
+      // 丢弃会让上游直接拒绝。次序也必须与 CC CLI 的抓包格式一致 ——
+      // [reasoning, text, tool-call]，reasoning 在最前。
+      if (msg.reasoning_content) {
+        parts.push({ type: 'reasoning', text: msg.reasoning_content });
+      }
       if (msg.content && typeof msg.content === 'string') {
-        parts.push({ type: 'text', text: msg.content });
+        if (msg.content) parts.push({ type: 'text', text: msg.content });
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
+          if (!part) continue;
           if (part.type === 'text') parts.push(part);
+          // 客户端直接把 reasoning 放在 content 数组里时同样透传；
+          // 已有 reasoning_content 字段则不重复
+          else if (part.type === 'reasoning' && !msg.reasoning_content) parts.push(part);
         }
       }
       if (msg.tool_calls) {
@@ -1409,11 +1419,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
   for (const msg of messages) {
     if (msg.role === 'assistant') {
       let textContent = '';
+      // Anthropic 的 thinking block 承载思考内容，需转成 reasoning_content
+      // 交给 buildCcRequest 回传，否则 CC 会因缺少 reasoning 而拒绝
+      let thinkingContent = '';
       const toolCalls = [];
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }];
       for (const block of blocks) {
         if (block.type === 'text') {
           textContent += block.text || '';
+        } else if (block.type === 'thinking') {
+          thinkingContent += block.thinking || '';
         } else if (block.type === 'tool_use') {
           toolNameFromId[block.id] = block.name;
           toolCalls.push({
@@ -1427,6 +1442,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
         }
       }
       const assistantMsg = { role: 'assistant', content: textContent || null };
+      if (thinkingContent) assistantMsg.reasoning_content = thinkingContent;
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       openaiMessages.push(assistantMsg);
     } else if (msg.role === 'user') {
