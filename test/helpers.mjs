@@ -10,6 +10,19 @@ import { fileURLToPath } from 'node:url';
 
 export const REPO = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]test$/, '');
 
+// ── 挂起保护 ──────────────────────────────────────────────
+// 不能用 --test-timeout：Node 18 没有该选项（20.11 才加入），加了会让
+// engines 下限直接跑不起来。改用启动一个 unref 的定时器，进程若因泄漏
+// 的 socket / 未 await 的句柄而无法退出，到点强制退出并说明原因。
+// 正常结束时定时器被 unref，不阻止退出。
+const HANG_GUARD_MS = Number(process.env.CC_TEST_HANG_GUARD_MS ?? 120000);
+const hangGuard = setTimeout(() => {
+  console.error('[test] 超时未退出：疑似有 server/socket 未关闭（' +
+    '检查每个测试是否都在 finally 里 await close()）。强制退出。');
+  process.exit(1);
+}, HANG_GUARD_MS);
+hangGuard.unref?.();
+
 // 取一个当前空闲的端口：让内核分配（listen 0）后立刻释放。
 // 不能用 pid 派生区间 —— node --test 各文件并行，pid 取模会在不同 pid 间
 // 映射到同一区间（如 pid 100 与 pid 600 同桶），进而偶发 EADDRINUSE。
@@ -24,6 +37,20 @@ export async function allocPort() {
       srv.close(() => resolve(port));
     });
   });
+}
+
+/**
+ * 关闭一个 http server，且**保证有界**。
+ * server.close() 只停止接受新连接，会一直等到既有连接结束 —— 若有 keep-alive
+ * 或未被对端关闭的 socket，它会永远挂着，把 CI 拖到 job 超时。
+ * （实际发生过：Fork 测试漏写一个 await 导致 mock 泄漏，三个矩阵 job 全部
+ *   空转 10 分钟后被取消。）故先强制断开所有连接，再 close，并叠加兜底超时。
+ */
+export async function closeServer(server, timeoutMs = 3000) {
+  if (!server || !server.listening) return;
+  try { server.closeAllConnections?.(); } catch {}
+  await Promise.race([new Promise(r => server.close(r)), sleep(timeoutMs)]);
+  try { server.closeAllConnections?.(); } catch {}
 }
 
 /** 启动一个 mock 上游。ndjson 为要回给代理的 CC NDJSON 行数组。 */
@@ -56,7 +83,7 @@ export async function startMockUpstream(opts = {}) {
     });
   });
   await new Promise(r => server.listen(port, '127.0.0.1', r));
-  return { port, seen, close: () => new Promise(r => server.close(r)),
+  return { port, seen, close: () => closeServer(server),
     // 最后一次 /alpha/generate 的请求体（wire 层断言的主要入口）
     lastGenerate: () => {
       const g = seen.filter(s => s.url === '/alpha/generate').pop();
