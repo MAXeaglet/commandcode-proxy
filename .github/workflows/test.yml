@@ -2,18 +2,29 @@ name: Test
 
 on:
   push:
-    branches: ['**']
+    # 只在这些长期分支上跑 push；其余分支靠 pull_request 触发，避免同一提交跑两遍
+    branches: [master, release]
   pull_request:
   workflow_dispatch:
+
+# 同一分支的新推送取消旧运行，避免排队浪费
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        # 覆盖 engines 下限与 Dockerfile 使用的版本
+        # engines 下限是 18；Dockerfile 用 22；中间放 20 覆盖 LTS 跨度
         node: ['18', '20', '22']
+    name: node ${{ matrix.node }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,20 +34,11 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      - name: Show version
+      - name: Show Node version
         run: node --version
+
+      - name: Syntax check
+        run: node --check proxy.mjs
 
       - name: Run tests
         run: npm test
-
-  # 单独一条：确认 proxy.mjs 语法可被最低支持版本解析。
-  # setup-node 的解析失败会表现为进程启动即崩，与测试失败混淆，故单列出来。
-  syntax:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-      - name: node --check
-        run: node --check proxy.mjs

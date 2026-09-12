@@ -3,21 +3,32 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { mkdtempSync, copyFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, copyFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const REPO = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]test$/, '');
 
-// 每个用例拿到独立端口。node --test 每个文件一个进程，用 pid 派生基数，
-// 并用随机起点降低跨进程撞端口的概率。
-let nextPort = 40000 + (process.pid % 500) * 40 + Math.floor(Math.random() * 20);
-export const allocPort = () => nextPort++;
+// 取一个当前空闲的端口：让内核分配（listen 0）后立刻释放。
+// 不能用 pid 派生区间 —— node --test 各文件并行，pid 取模会在不同 pid 间
+// 映射到同一区间（如 pid 100 与 pid 600 同桶），进而偶发 EADDRINUSE。
+// 内核分配把冲突面缩到「释放到重新占用」之间的极小窗口，调用方另有重试兜底。
+import net from 'node:net';
+export async function allocPort() {
+  return await new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
 
 /** 启动一个 mock 上游。ndjson 为要回给代理的 CC NDJSON 行数组。 */
 export async function startMockUpstream(opts = {}) {
-  const port = allocPort();
+  const port = await allocPort();
   const seen = [];
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -56,8 +67,10 @@ export async function startMockUpstream(opts = {}) {
 
 /** 在临时 cwd 中启动代理（复刻真实部署：proxy.mjs 与 config.json 同目录）。 */
 export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
-  const port = allocPort();
+  const port = await allocPort();
   const logs = [];
+  // 自建的临时工作目录用完必须删；调用方传了 cwd 则由调用方负责。
+  const ownWorkdir = cwd === undefined;
   const workdir = cwd ?? mkdtempSync(join(tmpdir(), 'ccp-test-'));
   copyFileSync(join(REPO, 'proxy.mjs'), join(workdir, 'proxy.mjs'));
   if (!existsSync(join(workdir, 'config.json'))) {
@@ -90,7 +103,17 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...headers },
       body: typeof body === 'string' ? body : JSON.stringify(body),
     }),
-    kill: () => new Promise(r => { child.once('exit', r); child.kill(); setTimeout(r, 2000); }),
+    kill: () => new Promise(r => {
+      child.once('exit', () => {
+        if (ownWorkdir) { try { rmSync(workdir, { recursive: true, force: true }); } catch {} }
+        r();
+      });
+      child.kill();
+      setTimeout(() => {
+        if (ownWorkdir) { try { rmSync(workdir, { recursive: true, force: true }); } catch {} }
+        r();
+      }, 2000);
+    }),
   };
 }
 
