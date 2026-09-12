@@ -2218,7 +2218,13 @@ function convertResponsesToChat(respReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
-      switch (item.type) {
+      // OpenAI 规范里 input 数组的联合类型第一个成员是 EasyInputMessage，它的
+      // required 只有 role 与 content —— type 是可选的（官方文档与 SDK 示例普遍写作
+      // { role: 'user', content: 'hi' }）。item.type 为 undefined 但有 role 时按
+      // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
+      // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
+      // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
+      switch (item.type ?? (item.role ? 'message' : undefined)) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -2254,7 +2260,10 @@ function convertResponsesToChat(respReq) {
           });
           break;
         }
-        default: break;
+        default: {
+          log('warn', 'Unknown Responses input item type', { type: item.type });
+          break;
+        }
       }
     }
   }
