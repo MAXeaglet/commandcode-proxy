@@ -1,0 +1,44 @@
+name: Test
+
+on:
+  push:
+    # 只在这些长期分支上跑 push；其余分支靠 pull_request 触发，避免同一提交跑两遍
+    branches: [master, release]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消旧运行，避免排队浪费
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines 下限是 18；Dockerfile 用 22；中间放 20 覆盖 LTS 跨度
+        node: ['18', '20', '22']
+    name: node ${{ matrix.node }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Show Node version
+        run: node --version
+
+      - name: Syntax check
+        run: node --check proxy.mjs
+
+      - name: Run tests
+        run: npm test
