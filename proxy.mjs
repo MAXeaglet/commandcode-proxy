@@ -206,6 +206,15 @@ function log(level, msg, data) {
   }
 }
 
+// 把上游错误体摘要成单行，便于日志排查。
+// 之前 CC API error 只记 status，不记 body —— 遇到 400 只能靠猜（问题来源见 hk_sji 排查）。
+// 截断到 500 字符，避免异常大的 body 刷爆日志；同时压掉换行，保证一条日志一行。
+function summarizeUpstreamError(text, limit = 500) {
+  if (!text) return '';
+  const flat = String(text).replace(/\s+/g, ' ').trim();
+  return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
+}
+
 // ── 会话管理 ───────────────────────────────────────
 // 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
 // 同一 Key 在同一周期内复用，到期自动换新
@@ -1027,7 +1036,7 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status });
+      log('error', 'CC API error', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendJSON(res, mapped.status, mapped.body);
       return;
@@ -1833,7 +1842,7 @@ async function handleMessages(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
@@ -2621,7 +2630,7 @@ async function handleResponses(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses' });
+      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', body: summarizeUpstreamError(errorText) });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
