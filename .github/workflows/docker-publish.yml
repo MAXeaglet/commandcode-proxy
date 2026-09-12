@@ -36,10 +36,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # `latest` 之前只在打 v* tag 时更新，导致用 :latest 的用户长期停在旧版本
+          # （新端点如 /v1/responses 因此表现为 404）。改为跟随 release 分支。
           tags: |
             type=ref,event=tag
             type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
