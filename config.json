@@ -6,5 +6,6 @@
   "projectSlug": "cc-proxy",
   "logFile": "",
   "logLevel": "info",
-  "zdr": false
+  "zdr": false,
+  "upstreamProxy": ""
 }

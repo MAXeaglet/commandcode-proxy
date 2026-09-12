@@ -3,6 +3,9 @@
  * 基于真实 CLI 流量抓包数据构建
  */
 import http from 'http';
+import https from 'https';
+import tls from 'tls';
+import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
@@ -24,6 +27,7 @@ function loadConfig() {
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
+    upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -45,6 +49,7 @@ function loadConfig() {
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
+  if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
 
   return defaults;
 }
@@ -309,7 +314,7 @@ async function ensureInitialized(apiKey, signal) {
     const fingerprint = state.fingerprint || {};
 
     await Promise.all([
-      fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+      upstreamFetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
         method: 'POST', headers, signal,
         body: JSON.stringify(fingerprint),
       }).then(r => {
@@ -319,7 +324,7 @@ async function ensureInitialized(apiKey, signal) {
         if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
       }),
 
-      fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+      upstreamFetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
         method: 'POST', headers, signal,
         body: JSON.stringify({
           eventType: 'cli_session_exists',
@@ -957,6 +962,117 @@ function getApiKey(headers) {
   return null;
 }
 
+// ── 上游 HTTP(S) 代理（issue #18）────────────────────
+// 仅作用于发往 CC 上游的请求（/alpha/generate、/provider/v1/models）。
+// 本地监听、/health 与 npm registry 版本检查都不经过代理。
+//
+// 零依赖实现：自己建立 CONNECT 隧道，再用 node:https 复用同一个 socket，
+// 因此不需要 undici / https-proxy-agent，engines >=18 也能用。
+// 注意 Node 原生 fetch 不读 HTTPS_PROXY/HTTP_PROXY；官方的环境变量方案需要
+// Node >= 22.21 / 24.5 并设 NODE_USE_ENV_PROXY=1（README 有说明）。
+const UPSTREAM_PROXY = CFG.upstreamProxy || '';
+const PROXY_CONNECT_TIMEOUT_MS = 15000;
+
+function parseProxyUrl(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`upstreamProxy is not a valid URL: ${raw}`);
+  }
+  if (u.protocol !== 'http:') {
+    throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
+  }
+  const auth = u.username
+    ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
+    : null;
+  return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
+}
+
+/** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
+function headersToInit(raw) {
+  const out = [];
+  for (const [k, v] of Object.entries(raw)) {
+    if (Array.isArray(v)) { for (const item of v) out.push([k, String(item)]); }
+    else if (v !== undefined) out.push([k, String(v)]);
+  }
+  return out;
+}
+
+/** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
+async function proxyFetch(urlStr, options = {}) {
+  const proxy = parseProxyUrl(UPSTREAM_PROXY);
+  const u = new URL(urlStr);
+  const isTls = u.protocol === 'https:';
+  const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
+  const target = `${u.hostname}:${port}`;
+  const { signal, body } = options;
+  const onAbort = (fn) => { if (signal) signal.addEventListener('abort', fn, { once: true }); };
+
+  // 1. CONNECT 隧道 —— 代理只做裸字节转发，TLS 由本端端到端完成
+  const rawSocket = await new Promise((resolve, reject) => {
+    const connectReq = http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: target,
+      headers: { Host: target, ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
+      timeout: PROXY_CONNECT_TIMEOUT_MS,
+    });
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`upstream proxy CONNECT ${target} failed: HTTP ${res.statusCode}`));
+        return;
+      }
+      resolve(socket);
+    });
+    connectReq.on('timeout', () => connectReq.destroy(new Error('upstream proxy CONNECT timeout')));
+    connectReq.on('error', reject);
+    onAbort(() => { try { connectReq.destroy(); } catch {} });
+    connectReq.end();
+  });
+
+  // 2. 隧道上做 TLS（证书按目标主机名校验，不做任何降级）
+  let socket = rawSocket;
+  if (isTls) {
+    socket = tls.connect({ socket: rawSocket, servername: u.hostname });
+    await new Promise((resolve, reject) => {
+      socket.once('secureConnect', resolve);
+      socket.once('error', reject);
+      onAbort(() => { try { socket.destroy(); } catch {} });
+    });
+  }
+
+  // 3. 复用隧道 socket 发请求
+  return await new Promise((resolve, reject) => {
+    const mod = isTls ? https : http;
+    const req = mod.request({
+      host: u.hostname,
+      port,
+      path: u.pathname + u.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      createConnection: () => socket,
+    }, (res) => {
+      resolve(new Response(Readable.toWeb(res), {
+        status: res.statusCode,
+        statusText: res.statusMessage,
+        headers: headersToInit(res.headers),
+      }));
+    });
+    req.on('error', reject);
+    onAbort(() => { try { req.destroy(); } catch {} });
+    if (body !== undefined && body !== null) req.write(body);
+    req.end();
+  });
+}
+
+/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
+function upstreamFetch(urlStr, options) {
+  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -980,7 +1096,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     headers['x-cmd-zdr'] = '1';
   }
 
-  const response = await fetch(url, {
+  const response = await upstreamFetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -2138,7 +2254,7 @@ async function fetchModels(apiKey) {
   try {
     if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
-    const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
+    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'x-cli-environment': 'production',
@@ -2936,6 +3052,7 @@ server.listen(CFG.port, CFG.host, () => {
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
+    upstreamProxy: UPSTREAM_PROXY || '(direct)',
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
@@ -2947,7 +3064,7 @@ server.listen(CFG.port, CFG.host, () => {
     log('warn', 'Request body limit implies high per-request worst-case memory', {
       maxBodyMB: bodyCapMB,
       worstCaseRSSPerRequestMB: worstCaseMB,
-      hint: 'lower CC_MAX_BODY_MB and/or cap in-flight requests at the reverse proxy (see README)',
+      hint: 'lower CC_MAX_BODY_MB, set CC_MAX_INFLIGHT, and/or cap in-flight requests at the reverse proxy (see README)',
     });
   }
   if (!CFG.apiKey) {
