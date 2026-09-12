@@ -76,6 +76,7 @@ commandcode/
 | `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
 | `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
+| `CC_API_KEY` | `apiKey`（亦支持 `COMMAND_CODE_API_KEY`） |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
