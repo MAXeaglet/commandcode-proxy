@@ -357,9 +357,9 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 
 | 机制 | 实现 |
 |------|------|
-| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
-| **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
-| **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
+| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新；状态仅存内存（重启即换），空闲 12h+1h 抖动后回收重建 |
+| **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
+| **会话标识** | 长度 ≥ 8 的客户端会话标识优先（`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`）；缺失时按 `apiKey + model + system + 首个非 user 消息之前的连续 user 文本` 派生确定性 UUID，同一会话跨轮次保持稳定 |
 | **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
 | **CLI 信封格式** | config/memory/taste/skills/permissionMode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
@@ -603,7 +603,7 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 
 - **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
 - **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
-- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
+- **多账号 + 多实例**：`keyStateStore` 是进程内 `Map`，同一个 API key 打到两个实例会得到**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。会话标识不受影响：它由请求内容派生（或直接来自客户端），各实例结果一致。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
 
 ## 免责声明
 

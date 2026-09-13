@@ -359,9 +359,9 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
-| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
-| **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
+| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter; state lives in memory only (restart ⇒ new fingerprint) and is reclaimed after 12h + 1h jitter idle |
+| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on key init |
+| **Session ID** | A client-supplied ID of at least 8 chars wins (`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`); otherwise a deterministic UUID derived from apiKey + model + system + the contiguous `user` text up to the first non-`user` message, so it stays stable across turns of the same session |
 | **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
 | **CLI Envelope** | config/memory/taste/skills/permissionMode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
@@ -600,7 +600,7 @@ A more robust cap still belongs at the reverse proxy (`limit_conn`), since only 
 
 - **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
 - **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
-- **Multi-account + multiple instances**: `sessionStore` / `keyStateStore` are per-process `Map`s, so the same API key served by two instances gets two different sessions and **two different device fingerprints** — upstream sees one account on multiple machines. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
+- **Multi-account + multiple instances**: `keyStateStore` is a per-process `Map`, so the same API key served by two instances gets **two different device fingerprints** — upstream sees one account on multiple machines. Session IDs are not affected: they are content-derived (or come from the client), so every instance agrees on them. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
 
 ## Disclaimer
 

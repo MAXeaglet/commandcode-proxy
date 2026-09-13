@@ -51,7 +51,7 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 指纹生成（首次运行自动生成，写回 config.json） ──────
+// ── 指纹生成（运行时自动生成） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
@@ -216,44 +216,39 @@ function summarizeUpstreamError(text, limit = 500) {
 }
 
 // ── 会话管理 ───────────────────────────────────────
-// 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
-// 同一 Key 在同一周期内复用，到期自动换新
-const SESSION_DURATION_MS = 12 * 60 * 60 * 1000;    // 12h
-const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
+// 优先采用客户端显式会话标识；缺失时按请求内容派生，派生值直接作为上游 x-session-id。
+// 下面两个常量是 Key 指纹状态的空闲回收窗口，与会话标识无关。
+const KEY_IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000;    // 12h — 指纹空闲回收窗口
+const KEY_IDLE_JITTER_MS  = 60 * 60 * 1000;         // 1h 抖动范围
 
-const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
-
-function ensureSession(apiKey) {
-  const now = Date.now();
-  const entry = sessionStore.get(apiKey);
-
-  if (entry && now < entry.expiresAt) {
-    return entry.sessionId;
+/**
+ * 按请求内容派生 UUID：apiKey + model + system + 首个非 user 消息之前的连续 user 文本。
+ */
+function deriveSessionId(apiKey, ccBody) {
+  const params = (ccBody && ccBody.params) || {};
+  const parts = [apiKey || '', params.model || '', params.system || ''];
+  for (const msg of params.messages || []) {
+    if (msg.role !== 'user') break; // assistant / tool 起始后的输入不参与派生
+    const content = msg.content;
+    if (typeof content === 'string') parts.push(content);
+    else if (Array.isArray(content)) 
+      parts.push(content.map(p => (p && typeof p.text === 'string') ? p.text : '').join(''));
+    else parts.push('');
   }
 
-  // 过期或第一次：生成新 session
-  const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
-  const sessionId = randomUUID();
-  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
-      log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
-  return sessionId;
+  const h = crypto.createHash('sha1');
+  for (const p of parts) {
+    h.update(typeof p === 'string' ? p : String(p));
+    h.update('\0'); // 分段边界，避免 ["ab","c"] 与 ["a","bc"] 投影到同一个 ID
+  }
+  const bytes = h.digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; 
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-// 定期清理过期 session 和 key 状态，防止 Map 无限增长
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [key, entry] of sessionStore) {
-    if (now >= entry.expiresAt) {
-      sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
-      cleaned++;
-    }
-  }
-  if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000); // 每小时
-
-function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
+function getSessionId(incomingHeaders, apiKey, promptCacheKey, ccBody) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
@@ -264,8 +259,8 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
   }
-  // 按 API Key 分 session
-  return ensureSession(apiKey);
+  // 客户端未提供会话标识（如 GitHub Copilot 只发 chat 协议、无会话级字段）时按请求内容派生
+  return deriveSessionId(apiKey, ccBody);
 }
 
 // 每个请求独立 thread ID
@@ -273,7 +268,7 @@ function newThreadId() { return randomUUID(); }
 
 // ── 每 Key 独立状态（fingerprint + 初始化节流） ──
 // 每个 API Key 拥有自己的设备指纹和初始化定时器
-const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, lastSeenAt, idleTimeout }
 
 function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
@@ -281,12 +276,27 @@ function getOrCreateKeyState(apiKey) {
     state = {
       fingerprint: generateFingerprint(),
       nextInitAt: 0,
+      lastSeenAt: 0,
+      // 每个 Key 在创建时各取一个抖动值并沿用，避免所有 Key 在同一时刻集中被回收
+      idleTimeout: KEY_IDLE_TIMEOUT_MS + Math.floor(Math.random() * KEY_IDLE_JITTER_MS),
     };
     keyStateStore.set(apiKey, state);
     log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
   }
+  state.lastSeenAt = Date.now();
   return state;
 }
+
+// 定期回收空闲 Key 的指纹状态，防止 Map 无限增长
+setInterval(() => {
+  const now = Date.now();
+  for (const [apiKey, state] of keyStateStore) {
+    if (now - state.lastSeenAt > state.idleTimeout) {
+      keyStateStore.delete(apiKey);
+      log('info', 'Key state cleaned', { keyPrefix: apiKey.slice(0, 8) });
+    }
+  }
+}, 60 * 60 * 1000); // 每小时
 
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
@@ -390,7 +400,7 @@ const MODELS = [
 // ── 工具函数 ───────────────────────────────────────
 
 // 从 sessionId 构造一个假的工作目录路径，再按真实 CLI 规则生成 slug
-// 结果形如 "d-users-dev-projects-web-app-a3f2" (和真实 CLI 的 slug 格式一致)
+// 结果形如 "users-dev-projects-web-a3f2" (和真实 CLI 的 slug 格式一致；盘符与路径分隔符统一规整为 '-')
 function fakeProjectSlug(sessionId) {
   const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
     'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
@@ -962,7 +972,7 @@ function getApiKey(headers) {
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey, body);
 
   const headers = {
     'Content-Type': 'application/json',
@@ -2938,7 +2948,7 @@ server.listen(CFG.port, CFG.host, () => {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
     models: MODELS.length,
-    session: '12h + 1h jitter, per API key',
+    session: 'content-derived x-session-id',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
