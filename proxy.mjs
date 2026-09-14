@@ -60,23 +60,23 @@ function loadConfig() {
 const CFG = loadConfig();
 
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
-// CPU 型号与核心数对应表（仅 Windows x64）
+// CPU 型号与核数对应表（仅 Windows x64）。CLI 取 os.cpus().length —— 那是逻辑处理器数
 const FINGERPRINT_CPUS = [
-  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
-  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
-  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14 },
-  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) Ultra 7 155H', cores: 16 },
-  { model: 'Intel(R) Core(TM) Ultra 9 285H', cores: 16 },
-  { model: 'Intel(R) Core(TM) i9-14900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) i7-14700K', cores: 20 },
-  { model: 'AMD Ryzen 7 7800X3D', cores: 8 },
-  { model: 'AMD Ryzen 9 7950X', cores: 16 },
-  { model: 'AMD Ryzen 5 7600', cores: 6 },
-  { model: 'AMD Ryzen 9 7900X', cores: 12 },
-  { model: 'AMD Ryzen 7 5800X3D', cores: 8 },
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10, threads: 16 },   // 6P+4E
+  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6,  threads: 12 },
+  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14, threads: 20 },   // 6P+8E
+  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) Ultra 7 155H',       cores: 16, threads: 22 },   // 6P+8E+2LPE
+  { model: 'Intel(R) Core(TM) Ultra 9 285H',       cores: 16, threads: 16 },   // 6P+8E+2LPE，无超线程
+  { model: 'Intel(R) Core(TM) i9-14900K',          cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) i7-14700K',          cores: 20, threads: 28 },   // 8P+12E
+  { model: 'AMD Ryzen 7 7800X3D',                  cores: 8,  threads: 16 },
+  { model: 'AMD Ryzen 9 7950X',                    cores: 16, threads: 32 },
+  { model: 'AMD Ryzen 5 7600',                     cores: 6,  threads: 12 },
+  { model: 'AMD Ryzen 9 7900X',                    cores: 12, threads: 24 },
+  { model: 'AMD Ryzen 7 5800X3D',                  cores: 8,  threads: 16 },
 ];
 const FINGERPRINT_MEMS = [8, 16, 24, 32, 48, 64];
 const FINGERPRINT_TZS = [
@@ -85,7 +85,36 @@ const FINGERPRINT_TZS = [
   'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Singapore', 'Asia/Seoul', 'Asia/Hong_Kong',
   'Australia/Sydney', 'Pacific/Auckland',
 ];
-const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
+// 真实网卡 MAC 的 OUI（前 3 字节由厂商分配）。这些首字节都满足真实网卡的两个位约束：
+// bit0（单播）=0、bit1（本地管理）=0 
+const FINGERPRINT_NIC_OUIS = [
+  '00:1b:21', '3c:97:0e', '8c:16:45', 'a4:bb:6d', 'e4:54:e8', // Intel
+  '00:e0:4c', '1c:bf:ce', '5c:f9:38',                         // Realtek
+  '00:14:22', '18:66:da', 'b0:83:fe', 'd4:be:d9',             // Dell
+  '00:1f:c6', '2c:56:dc', 'ac:22:0b',                         // ASUS
+  '50:c7:bf', 'a4:2b:b0',                                     // TP-Link
+  '00:12:fe', '54:05:db',                                     // Lenovo
+  '00:1e:0b', '3c:d9:2b', '94:57:a5',                         // HP
+  '00:16:17', '4c:cc:6a',                                     // MSI
+  '00:1e:33', 'f0:76:1c',                                     // Acer
+  '40:9b:cd', '00:03:7f',                                     // Qualcomm / Atheros
+  '00:10:18', '04:d4:c4',                                     // Broadcom
+  '1c:1b:0d', '74:d4:35',                                     // Gigabyte
+];
+// 虚拟适配器的 OUI：Hyper-V/WSL、VMware、VirtualBox、Docker。
+// 后两个（0a:00:27、02:42:ac）是本地管理地址（bit1=1），正是虚拟网卡在真实机器上的样子。
+const FINGERPRINT_VIRTUAL_OUIS = [
+  '00:15:5d', '00:50:56', '00:0c:29', '08:00:27', '0a:00:27', '02:42:ac',
+];
+// 程序员电脑可能的网卡组合：跳过 loopback 后真实机器最少 2 条
+// （Wi-Fi + 虚拟交换机 / 蓝牙 PAN），开发机多为 3 条，封顶 4 条。等概率挑一条。
+const FINGERPRINT_NIC_LAYOUTS = [
+  { phys: 1, virt: 1 },   // 2 — 无线笔记本 + WSL2/Hyper-V
+  { phys: 2, virt: 0 },   // 2 — 有线 + 无线的台式机，未装虚拟化
+  { phys: 2, virt: 1 },   // 3 — 有线 + 无线 + WSL2/Docker 的台式机
+  { phys: 1, virt: 2 },   // 3 — 无线本 + WSL 与 Docker/VMware 两个虚拟适配器
+  { phys: 2, virt: 2 },   // 4 — 有线 + 无线 + WSL2 与 VMware/VirtualBox
+];
 
 // CLI 的根盐（buildMachineFingerprint 常量 sb）
 const FP_SALT = 'command-code:device-fingerprint:v1';
@@ -127,6 +156,16 @@ function fingerprintHash(value) {
   return crypto.createHash('sha256').update(`${FP_SALT}\0${v.toLowerCase()}`).digest('hex');
 }
 
+/**
+ * 前 3 字节取 OUI，后 3 字节由 apiKey 派生 —— 与真实网卡一样的形状。
+ * 位约束（bit0 单播 =0、bit1 本地管理仅虚拟网卡 =1）由 OUI 表本身保证，见{@link FINGERPRINT_NIC_OUIS} 。
+ */
+function buildFingerprintMac(apiKey, field, oui) {
+  const b = fpDigest(apiKey, field).subarray(0, 6);
+  for (let i = 0; i < 3; i++) b[i] = parseInt(oui.slice(i * 3, i * 3 + 2), 16);
+  return [...b].map(x => x.toString(16).padStart(2, '0')).join(':');
+}
+
 // 与 CLI 的唯一区别是「信号值」：CLI 读真实机器（注册表 / ioreg / machine-id、网卡 MAC、
 // os.userInfo、git config），这里按 apiKey 确定性地伪造一组逼真值。
 // 为什么必须由 apiKey 派生而不是随机：指纹代表「这个账号对应的那台设备」，重启、内存回收、
@@ -135,7 +174,8 @@ function generateFingerprint(apiKey) {
   const cpuEntry = FINGERPRINT_CPUS[fpPickIndex(apiKey, 'cpu', FINGERPRINT_CPUS, i => `${FINGERPRINT_CPUS[i].model}|${FINGERPRINT_CPUS[i].cores}`)];
   const memGiB = FINGERPRINT_MEMS[fpPickIndex(apiKey, 'mem', FINGERPRINT_MEMS, i => String(FINGERPRINT_MEMS[i]))];
   const tz = FINGERPRINT_TZS[fpPickIndex(apiKey, 'timezone', FINGERPRINT_TZS, i => FINGERPRINT_TZS[i])];
-  const macCount = FINGERPRINT_MAC_COUNT_RANGE[fpPickIndex(apiKey, 'macCount', FINGERPRINT_MAC_COUNT_RANGE, i => String(FINGERPRINT_MAC_COUNT_RANGE[i]))];
+  // 注意：改这张网卡组合表 = 影响部分 key 的 MAC 条数（thumbmark 含全部 MAC）
+  const nic = FINGERPRINT_NIC_LAYOUTS[fpPickIndex(apiKey, 'nicLayout', FINGERPRINT_NIC_LAYOUTS, i => `${FINGERPRINT_NIC_LAYOUTS[i].phys}:${FINGERPRINT_NIC_LAYOUTS[i].virt}`)];
   const osUser = FP_OS_USERS[fpPickIndex(apiKey, 'osUser', FP_OS_USERS, i => FP_OS_USERS[i])];
   const mailDomain = FP_MAIL_DOMAINS[fpPickIndex(apiKey, 'mailDomain', FP_MAIL_DOMAINS, i => FP_MAIL_DOMAINS[i])];
   const hex = (field, bytes) => fpDigest(apiKey, field).subarray(0, bytes).toString('hex');
@@ -143,23 +183,26 @@ function generateFingerprint(apiKey) {
   const mid = hex('machineId', 16);
   const machineId = `${mid.slice(0, 8)}-${mid.slice(8, 12)}-${mid.slice(12, 16)}-${mid.slice(16, 20)}-${mid.slice(20, 32)}`;
   const macs = [];
-  for (let i = 0; i < macCount; i++) {
-    const b = fpDigest(apiKey, `mac${i}`).subarray(0, 6);
-    macs.push([...b].map(x => x.toString(16).padStart(2, '0')).join(':'));
+  for (let i = 0; i < nic.phys; i++) {
+    macs.push(buildFingerprintMac(apiKey, `mac${i}`, FINGERPRINT_NIC_OUIS[fpPickIndex(apiKey, `nicOui${i}`, FINGERPRINT_NIC_OUIS, j => FINGERPRINT_NIC_OUIS[j])]));
   }
-  macs.sort(); // CLI 对 MAC 去重后排序
+  for (let i = 0; i < nic.virt; i++) {
+    macs.push(buildFingerprintMac(apiKey, `macv${i}`, FINGERPRINT_VIRTUAL_OUIS[fpPickIndex(apiKey, `nicVirtOui${i}`, FINGERPRINT_VIRTUAL_OUIS, j => FINGERPRINT_VIRTUAL_OUIS[j])]));
+  }
+  // CLI 的 buildMachineFingerprint 是 [...new Set(macs)] 去重后再排序
+  const uniqueMacs = [...new Set(macs)].sort();
   const hostname = `DESKTOP-${hex('hostname', 4).toUpperCase()}`;
   const gitEmail = `${osUser}.${hex('gitEmail', 3)}@${mailDomain}`;
 
   const machineIdHash = fingerprintHash(machineId);
-  const macHashes = macs.map(fingerprintHash).filter(Boolean);
+  const macHashes = uniqueMacs.map(fingerprintHash).filter(Boolean);
   const osUserHash = fingerprintHash(osUser);
   const hostnameHash = fingerprintHash(hostname);
   const gitEmailHash = fingerprintHash(gitEmail);
 
   // CLI 的 thumbmark：主盐 + "\0machine\0" + join([machineId, macs.join(",")])
   // （machineId 非空时不再拼 hostname/cpuModel）
-  const thumbSeed = [machineId.trim(), macs.join(','), machineId.trim() ? '' : hostname, machineId.trim() ? '' : cpuEntry.model].filter(Boolean);
+  const thumbSeed = [machineId.trim(), uniqueMacs.join(','), machineId.trim() ? '' : hostname, machineId.trim() ? '' : cpuEntry.model].filter(Boolean);
   const thumbmark = crypto.createHash('sha256').update(`${FP_SALT}\0machine\0${thumbSeed.join('|') || 'unknown'}`).digest('hex');
 
   return {
@@ -174,7 +217,7 @@ function generateFingerprint(apiKey) {
       arch: DEVICE_PROFILE.arch,
       osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
-      cpuCount: cpuEntry.cores,
+      cpuCount: cpuEntry.threads,
       memGiB,
       isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
@@ -375,6 +418,7 @@ async function ensureInitialized(apiKey, signal) {
       'Content-Type': 'application/json',
       'x-cli-environment': 'production',
       'Authorization': `Bearer ${apiKey}`,
+      'User-Agent': 'cli',
       'x-command-code-version': CC_VERSION,
       ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
     };
@@ -588,7 +632,8 @@ function buildCcRequest(openaiReq) {
         content: [{
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
-          toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
+          // CLI 的兜底字面量是 "unknown"，不是空字符串
+          toolName: toolNameMap[msg.tool_call_id] || msg.name || 'unknown',
           output: { type: 'text', value: toWireToolOutputValue(msg.content) },
         }],
       };
