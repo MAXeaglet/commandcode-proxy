@@ -62,7 +62,7 @@ const CFG = loadConfig();
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
-  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
   { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
   { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
   { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
@@ -702,6 +702,8 @@ function tryParseJSON(str) {
 // ── CC NDJSON → OpenAI SSE 转换 ────────────────────
 
 function createSseTranslator(model, completionId, created) {
+  // 是否见过终态 finish 事件。CLI 用同一个标志判定「流是不是被截断了」。
+  let sawFinish = false;
   let chunkIndex = 0;
   let sentRole = false;
   let finishReason = null;
@@ -770,6 +772,7 @@ function createSseTranslator(model, completionId, created) {
         }
 
         case 'finish-step': {
+          sawFinish = true;
           if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
           if (event.usage) {
             usage = event.usage;
@@ -781,7 +784,8 @@ function createSseTranslator(model, completionId, created) {
         }
 
         case 'finish': {
-          const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
+          sawFinish = true;
+          const fr = toOpenAIFinishReason(finishReason || mapFinishReason(event.finishReason || 'stop'));
           const u = event.totalUsage || usage || {};
           normalizeUsage(u);
           this.inputTokens = u.inputTokens ?? 0;
@@ -816,6 +820,11 @@ function createSseTranslator(model, completionId, created) {
       }
 
       return out.length > 0 ? out : null;
+    },
+
+    /** 这次上游流若没有正常走完 finish，返回可读原因；正常则为 null。 */
+    incompleteDetail() {
+      return incompleteUpstreamDetail(sawFinish, finishReason);
     },
 
     /** 获取 SSE 结束标记 */
@@ -866,13 +875,56 @@ function anthropicInputTokens(usage, noCacheOverride) {
   return Math.max(0, (u.inputTokens || 0) - cacheRead - cacheWrite);
 }
 
+// 上游 finishReason → 本代理内部规范化取值。
+// 对齐 CLI 的 normalizeStopReason2 / isNetworkFailureFinish（command-code@1.54.0）：
+//   tool_use | tool-calls | tool_calls                    → tool_calls
+//   length | max_tokens | max_output_tokens
+//          | model_context_window_exceeded                → length
+//   /^(network|connection|upstream)[-_\s]?error$/i        → upstream_error
+//   pause_turn                                            → pause_turn（原样保留）
+// 关键点：'length' 家族**不止 'length' 一个值**。max_output_tokens 与
+// model_context_window_exceeded 都是「输出被截断」，折成 stop/end_turn 等于
+// 把半截回答谎报成完整回答。未知值一律原样返回，宁可让它露出来也不要静默折成 stop。
 function mapFinishReason(reason) {
-  switch (reason) {
-    case 'tool-calls': return 'tool_calls';
-    case 'length': return 'length';
-    case 'stop': return 'stop';
-    default: return reason || 'stop';
-  }
+  const r = String(reason ?? '').trim().toLowerCase();
+  if (!r) return 'stop';
+  if (r === 'tool-calls' || r === 'tool_calls' || r === 'tool_use') return 'tool_calls';
+  if (r === 'length' || r === 'max_tokens'
+      || r === 'max_output_tokens' || r === 'model_context_window_exceeded') return 'length';
+  if (/^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
+  return r;
+}
+
+// 上游「没有正常走完」的两种情形，CLI 都当成可重试的 502：
+//   · 流里根本没有 finish 事件 —— "Stream ended unexpectedly before completion
+//     (no finish event) — response was truncated"
+//   · provider 报 network/connection/upstream-error —— isNetworkFailureFinish
+// 返回 null 表示这次流是正常结束的。
+//
+// sawFinish 的口径是「上游给过任何完成信号」：终态 finish，以及本代理一直在处理的
+// finish-step。（'finish-step' 在 CLI 的事件集里不存在 —— 见 proxy.mjs 各处注释 ——
+// 但既然代理认它，就不能让它变成「没完成」，否则会把原本正常的响应误判成 502。
+// 真正要拦的是「一个完成信号都没有就断了」。）
+function incompleteUpstreamDetail(sawFinish, finishReason) {
+  if (!sawFinish) return 'no finish event';
+  if (finishReason === 'upstream_error') return 'provider reported an upstream connection failure';
+  return null;
+}
+
+function incompleteUpstreamError(detail) {
+  return {
+    status: 502,
+    // retry_after 同时放在 body 里与顶层：sendJSON 只发 body，
+    // 而 sendAnthropicError / sendResponsesError 需要单独的形参。
+    body: {
+      error: {
+        message: `Upstream stream ended without a completion finish (${detail}) — response was truncated`,
+        type: 'upstream_error',
+      },
+      retry_after: 10,
+    },
+    retry_after: 10,
+  };
 }
 
 // ── 错误映射 ───────────────────────────────────────
@@ -1252,6 +1304,18 @@ async function handleChatCompletions(req, res) {
               return;
             }
             try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
+          // 上游没有正常走完 finish（无 finish 事件 / provider 报连接失败）：
+          // 不能补一个 finish_reason 就 [DONE] —— 那等于把截断谎报成完整回答。
+          // 对齐 CLI：这一族一律按可重试的 502 处理。
+          // 必须排在零输出判定之前 —— 上游压根没发 finish 时，「no finish event」才是根因，
+          // 零输出只是它的表象（此时按 429 报会掩盖真实原因）。
+          } else if (translator.incompleteDetail()) {
+            const detail = translator.incompleteDetail();
+            log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: detail });
+            const err = incompleteUpstreamError(detail);
+            try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+            if (!started) { sendJSON(res, err.status, err.body); return; }
+            try { res.write(`data: ${JSON.stringify(err.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1325,6 +1389,7 @@ async function handleChatCompletions(req, res) {
       // ── 非流式响应（缓冲完整 NDJSON）──
       let reasoningContent = '';
       let finishReason = 'stop';
+      let sawFinish = false;
       let usage = null;
       let toolCalls = null;
       let upstreamError = null;
@@ -1356,8 +1421,10 @@ async function handleChatCompletions(req, res) {
                   },
                 });
                 break;
+              case 'finish-step':
               case 'finish':
                 lastCcEvent = event.type;
+                sawFinish = true;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
                 if (event.totalUsage) usage = event.totalUsage;
                 break;
@@ -1396,6 +1463,16 @@ async function handleChatCompletions(req, res) {
         return;
       }
 
+      // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
+      const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+      if (incomplete) {
+        log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: incomplete });
+        const err = incompleteUpstreamError(incomplete);
+        try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+        sendJSON(res, err.status, err.body);
+        return;
+      }
+
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1416,7 +1493,7 @@ async function handleChatCompletions(req, res) {
             toolCalls ? { tool_calls: toolCalls } : {},
             reasoningContent ? { reasoning_content: reasoningContent } : {},
           ),
-          finish_reason: finishReason,
+          finish_reason: toOpenAIFinishReason(finishReason),
         }],
     usage: (() => {
       if (!usage) usage = {};
@@ -1472,8 +1549,20 @@ function mapAnthropicStopReason(finishReason) {
     case 'tool_calls': return 'tool_use';
     case 'length': return 'max_tokens';
     case 'stop': return 'end_turn';
+    // Anthropic 的原生枚举，必须原样透出：它表示「这一轮被暂停，后面还有内容」。
+    // 折成 end_turn 会让下游把半截回答当成写完了（CLI 是靠自动续写把它吸收掉的，
+    // 代理不自动续写，就必须如实上报，不能吞掉）。
+    case 'pause_turn': return 'pause_turn';
+    case 'refusal': return 'refusal';
     default: return 'end_turn';
   }
+}
+
+// OpenAI 的 finish_reason 只有 stop | length | tool_calls | content_filter | function_call。
+// pause_turn 没有对应值：折成 'stop' 是谎报完成（正是要修的问题），
+// 折成 'length' 至少如实表达了「输出不完整」，下游的截断处理会做对的事。
+function toOpenAIFinishReason(finishReason) {
+  return finishReason === 'pause_turn' ? 'length' : finishReason;
 }
 
 // Generate a Claude-format fake signature for thinking blocks.
@@ -1711,6 +1800,11 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let cacheWriteTokens = 0;
   let noCacheTokens = -1;   // -1 = 上游未提供该字段，改用减法兜底
   let stopReason = null;
+  // 归一化后的 finishReason（mapAnthropicStopReason 之前的值），用于判定「是否正常结束」
+  let finishNorm = null;
+  // 是否见过终态 finish 事件。CLI 用同一个标志判定流是否被截断 —— 它只认 'finish'，
+  // 'finish-step' 不在 CLI 的事件集里，故这里同样只认 'finish'。
+  let sawFinish = false;
   let hasError = false;
   let currentThinkingText = ''; // accumulated thinking text for the open block
 
@@ -1844,7 +1938,11 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             // 上游的 finishReason 是 'tool-calls'（连字符），必须先过 mapFinishReason 规范化成
             // 'tool_calls'，否则会掉进 mapAnthropicStopReason 的 default 变成 end_turn。
             // 真机实测踩到过：工具调用成功但 stop_reason 报 end_turn。
-            if (event.finishReason) stopReason = mapAnthropicStopReason(mapFinishReason(event.finishReason));
+            sawFinish = true;   // finish-step 与 finish 都算完成信号
+            if (event.finishReason) {
+              finishNorm = mapFinishReason(event.finishReason);
+              stopReason = mapAnthropicStopReason(finishNorm);
+            }
             const u = event.totalUsage || event.usage;
             if (u) {
               normalizeUsage(u);
@@ -1895,8 +1993,15 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       const closeBlock = closeTextBlock();
       if (closeBlock) yield closeBlock;
 
+      // 上游没有正常走完 finish（无 finish 事件 / provider 报连接失败）：
+      // 绝不能补一个 end_turn 就 message_stop —— 那等于把截断谎报成完整回答。
+      // 对齐 CLI：这一族一律按可重试错误处理。
+      const incomplete = incompleteUpstreamDetail(sawFinish, finishNorm);
+      if (incomplete) {
+        log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: incompleteUpstreamError(incomplete).body.error })}\n\n`;
       // 输出 token 为 0 时记为错误，避免下游异常计费
-      if (outputTokens === 0) {
+      } else if (outputTokens === 0) {
         yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
       } else {
         yield `event: message_delta\ndata: ${JSON.stringify({
@@ -2140,6 +2245,7 @@ async function handleMessages(req, res) {
       // ── 非流式 Anthropic JSON ──
       const messageId = 'msg_' + randomUUID().slice(0, 12);
       let finishReason = 'stop';
+      let sawFinish = false;
       let usage = null;
       let toolCalls = null;
       let thinkingText = ''; // CC reasoning → Anthropic thinking block
@@ -2171,8 +2277,10 @@ async function handleMessages(req, res) {
                   },
                 });
                 break;
+              case 'finish-step':
               case 'finish':
                 lastCcEvent = event.type;
+                sawFinish = true;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
                 if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
                 break;
@@ -2209,6 +2317,18 @@ async function handleMessages(req, res) {
       if (upstreamError) {
         sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
         return;
+      }
+
+      // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
+      {
+        const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+        if (incomplete) {
+          log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+          const err = incompleteUpstreamError(incomplete);
+          try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+          sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+          return;
+        }
       }
 
       // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
@@ -2480,14 +2600,16 @@ function buildResponsesOutput(fullText, thinkingText, toolCalls) {
 function buildResponsesObject(responseId, model, created, fullText, thinkingText, toolCalls, usage, opts) {
   const o = opts || {};
   const truncated = o.finishReason === 'length';
+  const paused = o.finishReason === 'pause_turn';
   return {
     id: responseId,
     object: 'response',
     created_at: created,
-    status: truncated ? 'incomplete' : 'completed',
+    status: (truncated || paused) ? 'incomplete' : 'completed',
     completed_at: nowUnix(),
     error: null,
-    incomplete_details: truncated ? { reason: 'max_output_tokens' } : null,
+    incomplete_details: truncated ? { reason: 'max_output_tokens' }
+      : paused ? { reason: 'pause_turn' } : null,
     input: o.input || [],
     instructions: o.instructions === undefined ? null : o.instructions,
     max_output_tokens: o.max_output_tokens === undefined ? null : o.max_output_tokens,
@@ -2527,6 +2649,8 @@ function createResponsesSseTranslator(model, responseId, created) {
   let usage = null;
   let textAcc = '';
   let finishReason = null;
+  // 是否见过完成信号（见 incompleteUpstreamDetail 的口径说明）
+  let sawFinish = false;
 
   const baseResponse = (status, output) => ({
     id: responseId, object: 'response', created_at: created, status,
@@ -2653,7 +2777,10 @@ function createResponsesSseTranslator(model, responseId, created) {
         }
 
         case 'finish': {
-          finishReason = event.finishReason || null;
+          sawFinish = true;
+          // 必须归一化：截断类不止 'length'（还有 max_output_tokens /
+          // model_context_window_exceeded），原来直接比对原始值会漏判成 completed。
+          finishReason = event.finishReason ? mapFinishReason(event.finishReason) : null;
           const u = event.totalUsage || event.usage || null;
           if (u) {
             normalizeUsage(u);
@@ -2677,12 +2804,27 @@ function createResponsesSseTranslator(model, responseId, created) {
     finish() {
       if (!createdSent) return [];
       const out = closeItem();
-      // finishReason=length 表示被 max_output_tokens 截断：规范要求 status=incomplete
+      // 上游没有正常走完 finish —— 不能报 response.completed（那是把截断谎报成完整）。
+      // 对齐 CLI：按可重试的 upstream_error 处理。
+      const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+      if (incomplete) {
+        log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
+        out.push(sse('response.failed', {
+          response: Object.assign(baseResponse('failed'), {
+            error: { code: 'upstream_error', message: incompleteUpstreamError(incomplete).body.error.message },
+          }),
+        }));
+        return out;
+      }
+      // 'length' 表示被截断（max_output_tokens / model_context_window_exceeded 都归一到这里）；
+      // 'pause_turn' 同样是「后面还有内容没发完」，规范要求 status=incomplete。
       const truncated = finishReason === 'length';
-      out.push(sse(truncated ? 'response.incomplete' : 'response.completed', {
-        response: Object.assign(baseResponse(truncated ? 'incomplete' : 'completed', doneItems.slice()), {
+      const paused = finishReason === 'pause_turn';
+      out.push(sse(truncated || paused ? 'response.incomplete' : 'response.completed', {
+        response: Object.assign(baseResponse(truncated || paused ? 'incomplete' : 'completed', doneItems.slice()), {
           output_text: textAcc,
-          incomplete_details: truncated ? { reason: 'max_output_tokens' } : null,
+          incomplete_details: truncated ? { reason: 'max_output_tokens' }
+            : paused ? { reason: 'pause_turn' } : null,
           usage: buildResponsesUsage(usage, this.outputTokens),
         }),
       }));
@@ -2885,6 +3027,7 @@ async function handleResponses(req, res) {
       let thinkingText = '';
       let usage = null;
       let finishReason = 'stop';
+      let sawFinish = false;
       let upstreamError = null;
       const toolCalls = [];
       reader = ccResponse.body.getReader();
@@ -2914,8 +3057,10 @@ async function handleResponses(req, res) {
               });
               break;
             }
+            case 'finish-step':
             case 'finish':
               lastCcEvent = event.type;
+              sawFinish = true;
               finishReason = mapFinishReason(event.finishReason || 'stop');
               if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
               break;
@@ -2949,6 +3094,18 @@ async function handleResponses(req, res) {
         sendResponsesError(res, upstreamError.status, upstreamError.body.error.type,
           upstreamError.body.error.message, upstreamError.body.retry_after);
         return;
+      }
+
+      // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
+      {
+        const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+        if (incomplete) {
+          log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
+          const err = incompleteUpstreamError(incomplete);
+          try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+          sendResponsesError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+          return;
+        }
       }
 
       if (!fullText && !thinkingText && !toolCalls.length) {
