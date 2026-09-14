@@ -76,6 +76,7 @@ commandcode/
 | `CC_NONSTREAM_IDLE_MS` | Non-streaming upstream read idle timeout (default `90000`) |
 | `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
 | `CMD_ZDR` | `zdr` (`1` to enable) |
+| `CC_UPSTREAM_PROXY` | `upstreamProxy` |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -85,7 +86,27 @@ authority for actual retention and provider availability.
 
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
-> ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+> ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and the limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
+
+Route the requests the proxy makes **to Command Code** through a local HTTP proxy — for egress-region switching, or for comparing IPs when debugging risk-control `403`s.
+
+```json
+{ "upstreamProxy": "http://127.0.0.1:7890" }
+```
+
+```bash
+CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
+```
+
+- Applies to `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events` and `/provider/v1/models`.
+- **Does not** touch the local listener, `/health`, or the npm version check.
+- Only `http://` (CONNECT) proxies are supported. Implemented with a plain CONNECT tunnel plus `node:https`, so there is **no new dependency** and it works on Node 18+.
+- Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against `api.commandcode.ai`, never against the proxy.
+- Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
+
+> Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 
 ## API Endpoints
 
@@ -469,6 +490,7 @@ npm run docker:build:multi
 | `PORT` | `3050` | Container listen port |
 | `PROXY_PORT` | `3050` | Host port (compose only) |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
+| `CC_UPSTREAM_PROXY` | *(unset)* | `http://host:port` CONNECT proxy for upstream Command Code requests only |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout in ms |
@@ -542,7 +564,7 @@ The body exists in several copies before being forwarded: `chunks[]` / `Buffer.c
 | 20 MB | 100 MB | +116 MB (5.8×) | 200 |
 | 20 MB | 8 MB | +21 MB (1.05×) | **413** |
 
-At startup a `warn` is logged when the implied worst case is ≥ 500 MB. The limit is **per request** and the proxy does no in-flight limiting of its own — a public deployment must add both at the reverse proxy.
+At startup a `warn` is logged when the implied worst case is ≥ 500 MB. The body limit is **per request** — cap the multiplier with `CC_MAX_INFLIGHT` (in-process, global only), and add per-IP / per-key limits in the reverse proxy. A public deployment should do both.
 
 ### Suggested nginx front
 

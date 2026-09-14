@@ -76,6 +76,7 @@ commandcode/
 | `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
 | `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
+| `CC_UPSTREAM_PROXY` | `upstreamProxy` |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -84,6 +85,26 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
+
+让代理**发往 Command Code 的请求**走本地 HTTP 代理 —— 用于出口地区调整，或排查风控 `403` 时做 IP 维度对照。
+
+```json
+{ "upstreamProxy": "http://127.0.0.1:7890" }
+```
+
+```bash
+CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
+```
+
+- 作用于 `/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events` 与 `/provider/v1/models`。
+- **不影响**本地监听、`/health` 与 npm 版本检查。
+- 仅支持 `http://`（CONNECT）代理。实现方式是自建 CONNECT 隧道 + `node:https` 复用同一 socket，**不新增任何依赖**，Node 18+ 即可用。
+- 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按 `api.commandcode.ai` 校验，绝不针对代理降级。
+- **指纹/lifecycle 预请求也走代理**是刻意的：若它们直连而上游生成走代理，同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
+
+> Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
 
 ## API 接口
 
@@ -467,6 +488,7 @@ npm run docker:build:multi
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
+| `CC_UPSTREAM_PROXY` | 空 | 仅作用于 CC 上游请求的 `http://host:port` CONNECT 代理 |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
@@ -546,7 +568,7 @@ body 在转发到上游前同时存在多份副本：`chunks[]` / `Buffer.concat
 | 20 MB | 100 MB | +116 MB（5.8×）| 200 |
 | 20 MB | 8 MB | +21 MB（1.05×）| **413** |
 
-启动时若隐含最坏峰值 ≥ 500MB，日志会输出 `warn` 提示。上限是**按请求**的，proxy 自身没有在途限流 —— 公网部署必须在反向代理层补上。
+启动时若隐含最坏峰值 ≥ 500MB，日志会输出 `warn` 提示。body 上限是**按请求**的 —— 乘数用 `CC_MAX_INFLIGHT`（进程内、仅全局）封顶，按 IP / 按 key 的限流在反向代理层补上。公网部署建议两者都做。
 
 ### nginx 反代建议
 
