@@ -953,6 +953,14 @@ function readBody(req) {
     // 让客户端明确收到 413 而不是 Connection reset（issue #7）。
     // 但若客户端无视 413 持续上传超过 DRAIN_LIMIT，则强制掐断，不无限吞带宽。
     const DRAIN_LIMIT = 32 * 1024 * 1024;
+    // 读取 Content-Length 提前快速拦截
+    if (Number.parseInt(req.headers['content-length'] ?? '', 10) > MAX_BODY_SIZE) {
+      settled = true;
+      const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
+      const err = new Error(`Request body exceeds ${mb}MB limit`);
+      err.statusCode = 413;
+      reject(err);
+    }
     req.on('data', c => {
       if (settled) {
         drained += c.length;
@@ -974,7 +982,9 @@ function readBody(req) {
     req.on('end', () => {
       if (settled) return;
       settled = true;
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+      const raw = Buffer.concat(chunks);
+      chunks.length = 0;   // 提前清空避免被保留到 handler 结束
+      try { resolve(JSON.parse(raw.toString())); }
       catch { reject(new Error('Invalid JSON')); }
     });
     req.on('error', e => { if (!settled) { settled = true; reject(e); } });
