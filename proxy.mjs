@@ -3132,6 +3132,25 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
+// ── keep-alive 时序（放在反向代理后面时是必调项） ──────────────
+// 反代（nginx/OpenResty）的 upstream keepalive_timeout 必须**小于**这里的值，
+// 否则反代会复用一条后端已经关掉的连接：它把请求体写过去，后端早已 FIN，
+// 写这一侧就是 EPIPE —— nginx 侧表现为
+//   sendfile() failed (32: Broken pipe) while sending request to upstream
+// 而这条请求是 POST（非幂等），nginx 默认不会重试 → 客户端直接吃 502。
+//
+// Node 默认 keepAliveTimeout=5s。反代若用常见的 4s，余量只有 1 秒；一旦反代的
+// 空闲判定基准与后端差一点（大响应体读完的时刻 vs 后端写完的时刻），就会踩上。
+// 这里显式抬到 65s，让「谁先关」不再取决于一两秒的抖动 —— 与 Node 官方在
+// 反向代理后部署的建议一致（keepAliveTimeout > 前端 idle timeout）。
+// 反代侧仍建议设 keepalive_timeout 60s 以内。
+const KEEPALIVE_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_KEEPALIVE_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 65000;
+})();
+server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
+server.headersTimeout = KEEPALIVE_TIMEOUT_MS + 1000;   // Node 要求 headersTimeout > keepAliveTimeout
+
 server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
@@ -3142,6 +3161,7 @@ server.listen(CFG.port, CFG.host, () => {
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
+    keepAliveTimeout: `${KEEPALIVE_TIMEOUT_MS}ms (反代侧 keepalive_timeout 必须小于它)`,
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
   });

@@ -132,3 +132,20 @@ test('流空闲超时以 end() 收尾：已产生内容 + 错误事件都能完�
   } finally { await proxy.kill(); await upstream.close(); }
 });
 
+
+// ── ④ keep-alive 时序必须在启动横幅里可见 ──────────────────────
+// 反代的 upstream keepalive_timeout 必须小于后端的 keepAliveTimeout，否则反代会
+// 复用一条后端已关闭的连接，写请求体时吃 EPIPE（POST 非幂等、nginx 默认不重试
+// → 客户端直接 502）。Node 默认 5s 与反代常见的 4s 只差 1 秒，太薄。
+test('启动横幅打出 keepAliveTimeout，便于与反代配置对齐', async () => {
+  const s = await setup();
+  try {
+    const logs = s.proxy.logs();
+    assert.ok(/keepAliveTimeout[":\s]+65000ms/.test(logs),
+      '启动横幅必须打出 keepAliveTimeout。实际：\n' +
+      logs.split('\n').filter(l => l.includes('CC Proxy started')).join('\n'));
+    assert.ok(logs.includes('反代侧 keepalive_timeout 必须小于它'),
+      '必须提示反代侧的对应设置，否则这个值没有可操作性');
+  } finally { await s.close(); }
+});
+
