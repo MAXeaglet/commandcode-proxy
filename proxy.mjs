@@ -799,8 +799,16 @@ function createSseTranslator(model, completionId, created) {
 
         case 'error': {
           const msg = event.error?.message || event.message || 'Unknown error';
-          log('warn', 'CC stream error', { message: msg });
           this.upstreamError = mapCcEventError(event);
+          // 先映射再记日志，并把上游自带的状态/可重试性一并打出 ——
+          // 排查容量/限流类问题时，真正需要的就是这两个字段
+          log('warn', 'CC stream error', {
+            message: msg,
+            upstreamStatus: this.upstreamError.reportedStatus,
+            upstreamRetryable: event.error?.isRetryable,
+            code: this.upstreamError.code,
+            mappedTo: this.upstreamError.status,
+          });
           // Don't emit a finish_reason chunk — let the natural stream termination
           // handle it. Otherwise a subsequent finish(tool_calls) would be ignored
           // by downstream agent loops that stop at the first finish_reason.
@@ -924,8 +932,17 @@ function mapCcError(ccStatus, ccBody) {
 function mapCcEventError(event) {
   const message = event.error?.message || event.message || 'Unknown CC error';
   const code = event.error?.code || event.code || null;
+  // 上游 error 事件除了 message 还可能自带 statusCode / isRetryable ——
+  // CLI 的 readStreamErrorEvent 读的正是这两个字段，取值链是
+  //   parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null
+  // 原实现只看 message 里的 "<NNN>" 前缀，statusCode 一律被丢掉，
+  // 于是 429 / 503 这类「该退避重试」的信号在代理这一层被抹平成 502「服务端错误」：
+  // 客户端不再按限流退避，监控也会把它错误归类成后端故障。
   const statusMatch = message.match(/^<(\d{3})>/);
-  const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
+  const reportedStatus = statusMatch
+    ? Number(statusMatch[1])
+    : (Number.isInteger(event.error?.statusCode) ? event.error.statusCode : null);
+  const ccStatus = reportedStatus ?? 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
   // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
@@ -934,11 +951,13 @@ function mapCcEventError(event) {
     return {
       status: 429,
       code,
+      reportedStatus,
       body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
     };
   }
 
-  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
+  return { status: mapped.status, code, reportedStatus,
+    body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 // ── HTTP 请求处理 ──────────────────────────────────
@@ -1302,8 +1321,12 @@ async function handleChatCompletions(req, res) {
             return;
           }
           if (!res.writableEnded) {
-            try { res.write(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            // 必须 end() 而不是 destroy()：res.write 是异步的，紧接着 destroy 会把尚未
+            // 刷出的缓冲丢掉并发 RST。反向代理看到上游连接被重置，要么回 502，要么让
+            // 客户端看到 connection error —— 这正是"吐字慢 + 间歇性 502"的成因之一。
+            // end() 会把错误事件正常送进 SSE 流再发 FIN，客户端 SDK 能按可重试错误处理。
+            // 下游若已僵死（不读也不断），由 CLIENT_DRAIN_TIMEOUT_MS 那条路径负责兜底。
+            try { res.end(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
           }
         } else {
           log('error', 'Stream error', { message: e.message });
@@ -1363,10 +1386,23 @@ async function handleChatCompletions(req, res) {
                 break;
               case 'error':
                 lastCcEvent = event.type;
-                log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
+                log('warn', 'CC stream error (non-stream)', {
+                  message: event.error?.message || event.message,
+                  upstreamStatus: upstreamError.reportedStatus,
+                  upstreamRetryable: event.error?.isRetryable,
+                  code: upstreamError.code,
+                  mappedTo: upstreamError.status,
+                });
                 break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              // 无内容的事件：与流式翻译器的静默列表保持一致。
+              // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
+              // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
+              // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
+              case 'text-start': case 'text-end': case 'start': case 'start-step':
+              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'tool-error':
                 // Silent - no user-visible content
                 break;
               default:
@@ -2115,8 +2151,8 @@ async function handleMessages(req, res) {
             const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
-            try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
+            try { res.end(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
           }
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
@@ -2178,10 +2214,23 @@ async function handleMessages(req, res) {
                 break;
               case 'error':
                 lastCcEvent = event.type;
-                log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
+                log('warn', 'CC error (Anthropic non-stream)', {
+                  message: event.error?.message || event.message,
+                  upstreamStatus: upstreamError.reportedStatus,
+                  upstreamRetryable: event.error?.isRetryable,
+                  code: upstreamError.code,
+                  mappedTo: upstreamError.status,
+                });
                 break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              // 无内容的事件：与流式翻译器的静默列表保持一致。
+              // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
+              // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
+              // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
+              case 'text-start': case 'text-end': case 'start': case 'start-step':
+              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'tool-error':
                 // Silent - no user-visible content
                 break;
               default:
@@ -2860,8 +2909,8 @@ async function handleResponses(req, res) {
             : 'Response timeout - request timed out';
           if (!started) { sendResponsesError(res, 429, 'rate_limit_error', timeoutMsg, 5); return; }
           if (!res.writableEnded) {
-            try { res.write(translator.errorEvent(timeoutMsg)); } catch (e2) {}
-            try { res.destroy(); } catch (e2) {}
+            // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
+            try { res.end(translator.errorEvent(timeoutMsg)); } catch (e2) {}
           }
         } else {
           log('error', 'Stream error', { message: e.message, path: '/v1/responses' });
@@ -2921,8 +2970,25 @@ async function handleResponses(req, res) {
               break;
             case 'error':
               lastCcEvent = event.type;
-              log('warn', 'CC stream error (non-stream)', { message: event.error ? event.error.message : event.message });
               upstreamError = mapCcEventError(event);
+              log('warn', 'CC stream error (non-stream)', {
+                message: event.error ? event.error.message : event.message,
+                upstreamStatus: upstreamError.reportedStatus,
+                upstreamRetryable: event.error?.isRetryable,
+                code: upstreamError.code,
+                mappedTo: upstreamError.status,
+              });
+              break;
+            // 无内容的事件：与流式翻译器以及另两条非流式路径保持一致。
+            // 这条路径原先**没有静默列表**，于是上游每个响应都会发的一串无内容事件
+            //（text-start / text-end / start / start-step / reasoning-start / reasoning-end /
+            //  provider-metadata / tool-input-* / tool-error）全部掉进 default 打成
+            // 'Unknown CC event type'，线上刷屏、把真正的错误淹掉。
+            case 'text-start': case 'text-end': case 'start': case 'start-step':
+            case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+            case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+            case 'tool-error':
+              // Silent - no user-visible content
               break;
             default:
               log('warn', 'Unknown CC event type', { type: event.type });
@@ -3066,6 +3132,25 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
+// ── keep-alive 时序（放在反向代理后面时是必调项） ──────────────
+// 反代（nginx/OpenResty）的 upstream keepalive_timeout 必须**小于**这里的值，
+// 否则反代会复用一条后端已经关掉的连接：它把请求体写过去，后端早已 FIN，
+// 写这一侧就是 EPIPE —— nginx 侧表现为
+//   sendfile() failed (32: Broken pipe) while sending request to upstream
+// 而这条请求是 POST（非幂等），nginx 默认不会重试 → 客户端直接吃 502。
+//
+// Node 默认 keepAliveTimeout=5s。反代若用常见的 4s，余量只有 1 秒；一旦反代的
+// 空闲判定基准与后端差一点（大响应体读完的时刻 vs 后端写完的时刻），就会踩上。
+// 这里显式抬到 65s，让「谁先关」不再取决于一两秒的抖动 —— 与 Node 官方在
+// 反向代理后部署的建议一致（keepAliveTimeout > 前端 idle timeout）。
+// 反代侧仍建议设 keepalive_timeout 60s 以内。
+const KEEPALIVE_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_KEEPALIVE_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 65000;
+})();
+server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
+server.headersTimeout = KEEPALIVE_TIMEOUT_MS + 1000;   // Node 要求 headersTimeout > keepAliveTimeout
+
 server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
@@ -3076,6 +3161,7 @@ server.listen(CFG.port, CFG.host, () => {
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
+    keepAliveTimeout: `${KEEPALIVE_TIMEOUT_MS}ms (反代侧 keepalive_timeout 必须小于它)`,
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
   });
