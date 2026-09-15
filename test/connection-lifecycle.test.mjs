@@ -1,10 +1,12 @@
 // 连接生命周期与错误可观测性。
 // 这组用例来自一次真实线上故障的排查（间歇性反代 502 / 客户端 connection error）：
 //   ① 上游 error 事件自带 statusCode，被丢掉后 429/503 一律塌成 502
-//   ② 无内容事件的静默列表不全，Response 非流式那条**根本没有**，日志被刷屏
+//   ② 无内容事件的静默列表不全，Responses 非流式那条**根本没有**，日志被刷屏
+//   ③ 流空闲超时用 res.destroy() 收尾，把"代理主动截断"变成"把客户端连接搞断"
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { setup } from './helpers.mjs';
+import http from 'node:http';
+import { setup, startProxy, allocPort, closeServer } from './helpers.mjs';
 
 const AUTH = { Authorization: 'Bearer user_test' };
 const CHAT = { model: 'm', messages: [{ role: 'user', content: 'hi' }] };
@@ -85,3 +87,48 @@ test('标准 NDJSON 序列不产生任何 Unknown CC event type 警告（三协�
       logs.split('\n').filter(l => l.includes('Unknown CC')).join('\n'));
   } finally { await s.close(); }
 });
+
+// ── ③ 流空闲超时必须用 end() 收尾，不能 destroy() ──────────────
+// 原实现是 res.write(errEvent) 紧跟 res.destroy()：write 是异步的，destroy 会把
+// 尚未刷出的缓冲丢掉并发 RST。反代侧看到的就是 "upstream prematurely closed
+// connection" —— 响应头未转发时回 502，已转发时客户端看到 connection error。
+//
+// 判别方式：客户端必须能**完整读到**已产生的 delta 与超时错误事件。
+// destroy 会让这条读挂掉（ECONNRESET / terminated），end 则正常收束。
+
+/** 一个只在 /alpha/generate 上"发一半就挂住"的上游；其余路由正常应答。 */
+async function startStallingUpstream() {
+  const port = await allocPort();
+  const server = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      if (req.url !== '/alpha/generate') {
+        // 预请求（fingerprint / lifecycle）必须正常应答，否则代理会卡在初始化上
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('{"type":"text-start"}\n');
+      res.write('{"type":"text-delta","text":"partial-content"}\n');
+      // 之后不再写任何数据 → 触发代理的流空闲超时
+    });
+  });
+  await new Promise(r => server.listen(port, '127.0.0.1', r));
+  return { port, close: () => closeServer(server) };
+}
+
+test('流空闲超时以 end() 收尾：已产生内容 + 错误事件都能完整送达', async () => {
+  const upstream = await startStallingUpstream();
+  const proxy = await startProxy({ upstreamPort: upstream.port, env: { CC_STREAM_IDLE_MS: '300' } });
+  try {
+    const r = await proxy.post('/v1/chat/completions', { ...CHAT, stream: true }, AUTH);
+    const text = await r.text();
+    assert.equal(r.status, 200);
+    assert.ok(text.includes('partial-content'),
+      '已发出的内容不能因为收尾方式而丢失（destroy 会丢缓冲 + RST）');
+    assert.ok(text.includes('rate_limit_error'),
+      '超时错误事件必须完整送进流里，下游 SDK 才能按可重试错误处理');
+  } finally { await proxy.kill(); await upstream.close(); }
+});
+

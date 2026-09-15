@@ -1321,8 +1321,12 @@ async function handleChatCompletions(req, res) {
             return;
           }
           if (!res.writableEnded) {
-            try { res.write(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            // 必须 end() 而不是 destroy()：res.write 是异步的，紧接着 destroy 会把尚未
+            // 刷出的缓冲丢掉并发 RST。反向代理看到上游连接被重置，要么回 502，要么让
+            // 客户端看到 connection error —— 这正是"吐字慢 + 间歇性 502"的成因之一。
+            // end() 会把错误事件正常送进 SSE 流再发 FIN，客户端 SDK 能按可重试错误处理。
+            // 下游若已僵死（不读也不断），由 CLIENT_DRAIN_TIMEOUT_MS 那条路径负责兜底。
+            try { res.end(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
           }
         } else {
           log('error', 'Stream error', { message: e.message });
@@ -2147,8 +2151,8 @@ async function handleMessages(req, res) {
             const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
-            try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
+            try { res.end(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
           }
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
@@ -2905,8 +2909,8 @@ async function handleResponses(req, res) {
             : 'Response timeout - request timed out';
           if (!started) { sendResponsesError(res, 429, 'rate_limit_error', timeoutMsg, 5); return; }
           if (!res.writableEnded) {
-            try { res.write(translator.errorEvent(timeoutMsg)); } catch (e2) {}
-            try { res.destroy(); } catch (e2) {}
+            // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
+            try { res.end(translator.errorEvent(timeoutMsg)); } catch (e2) {}
           }
         } else {
           log('error', 'Stream error', { message: e.message, path: '/v1/responses' });
