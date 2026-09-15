@@ -799,8 +799,16 @@ function createSseTranslator(model, completionId, created) {
 
         case 'error': {
           const msg = event.error?.message || event.message || 'Unknown error';
-          log('warn', 'CC stream error', { message: msg });
           this.upstreamError = mapCcEventError(event);
+          // 先映射再记日志，并把上游自带的状态/可重试性一并打出 ——
+          // 排查容量/限流类问题时，真正需要的就是这两个字段
+          log('warn', 'CC stream error', {
+            message: msg,
+            upstreamStatus: this.upstreamError.reportedStatus,
+            upstreamRetryable: event.error?.isRetryable,
+            code: this.upstreamError.code,
+            mappedTo: this.upstreamError.status,
+          });
           // Don't emit a finish_reason chunk — let the natural stream termination
           // handle it. Otherwise a subsequent finish(tool_calls) would be ignored
           // by downstream agent loops that stop at the first finish_reason.
@@ -924,8 +932,17 @@ function mapCcError(ccStatus, ccBody) {
 function mapCcEventError(event) {
   const message = event.error?.message || event.message || 'Unknown CC error';
   const code = event.error?.code || event.code || null;
+  // 上游 error 事件除了 message 还可能自带 statusCode / isRetryable ——
+  // CLI 的 readStreamErrorEvent 读的正是这两个字段，取值链是
+  //   parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null
+  // 原实现只看 message 里的 "<NNN>" 前缀，statusCode 一律被丢掉，
+  // 于是 429 / 503 这类「该退避重试」的信号在代理这一层被抹平成 502「服务端错误」：
+  // 客户端不再按限流退避，监控也会把它错误归类成后端故障。
   const statusMatch = message.match(/^<(\d{3})>/);
-  const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
+  const reportedStatus = statusMatch
+    ? Number(statusMatch[1])
+    : (Number.isInteger(event.error?.statusCode) ? event.error.statusCode : null);
+  const ccStatus = reportedStatus ?? 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
   // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
@@ -934,11 +951,13 @@ function mapCcEventError(event) {
     return {
       status: 429,
       code,
+      reportedStatus,
       body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
     };
   }
 
-  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
+  return { status: mapped.status, code, reportedStatus,
+    body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 // ── HTTP 请求处理 ──────────────────────────────────
@@ -1363,10 +1382,23 @@ async function handleChatCompletions(req, res) {
                 break;
               case 'error':
                 lastCcEvent = event.type;
-                log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
+                log('warn', 'CC stream error (non-stream)', {
+                  message: event.error?.message || event.message,
+                  upstreamStatus: upstreamError.reportedStatus,
+                  upstreamRetryable: event.error?.isRetryable,
+                  code: upstreamError.code,
+                  mappedTo: upstreamError.status,
+                });
                 break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              // 无内容的事件：与流式翻译器的静默列表保持一致。
+              // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
+              // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
+              // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
+              case 'text-start': case 'text-end': case 'start': case 'start-step':
+              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'tool-error':
                 // Silent - no user-visible content
                 break;
               default:
@@ -2178,10 +2210,23 @@ async function handleMessages(req, res) {
                 break;
               case 'error':
                 lastCcEvent = event.type;
-                log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
+                log('warn', 'CC error (Anthropic non-stream)', {
+                  message: event.error?.message || event.message,
+                  upstreamStatus: upstreamError.reportedStatus,
+                  upstreamRetryable: event.error?.isRetryable,
+                  code: upstreamError.code,
+                  mappedTo: upstreamError.status,
+                });
                 break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              // 无内容的事件：与流式翻译器的静默列表保持一致。
+              // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
+              // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
+              // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
+              case 'text-start': case 'text-end': case 'start': case 'start-step':
+              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'tool-error':
                 // Silent - no user-visible content
                 break;
               default:
@@ -2921,8 +2966,25 @@ async function handleResponses(req, res) {
               break;
             case 'error':
               lastCcEvent = event.type;
-              log('warn', 'CC stream error (non-stream)', { message: event.error ? event.error.message : event.message });
               upstreamError = mapCcEventError(event);
+              log('warn', 'CC stream error (non-stream)', {
+                message: event.error ? event.error.message : event.message,
+                upstreamStatus: upstreamError.reportedStatus,
+                upstreamRetryable: event.error?.isRetryable,
+                code: upstreamError.code,
+                mappedTo: upstreamError.status,
+              });
+              break;
+            // 无内容的事件：与流式翻译器以及另两条非流式路径保持一致。
+            // 这条路径原先**没有静默列表**，于是上游每个响应都会发的一串无内容事件
+            //（text-start / text-end / start / start-step / reasoning-start / reasoning-end /
+            //  provider-metadata / tool-input-* / tool-error）全部掉进 default 打成
+            // 'Unknown CC event type'，线上刷屏、把真正的错误淹掉。
+            case 'text-start': case 'text-end': case 'start': case 'start-step':
+            case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+            case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+            case 'tool-error':
+              // Silent - no user-visible content
               break;
             default:
               log('warn', 'Unknown CC event type', { type: event.type });
