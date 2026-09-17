@@ -261,10 +261,12 @@ Health check. Returns `OK`.
 
 | HTTP Status | Description |
 |-------------|-------------|
-| 400 | Invalid request format |
+| 400 | Invalid request format, or an upstream error event declaring `statusCode: 400` (e.g. a content rejection) |
 | 401 | API Key missing / invalid format / rejected (Key must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
 | 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
-| 502 | CC upstream error |
+| 502 | CC upstream error — the event declares no status, or one with no mapped equivalent |
+
+CC reports failures inside the response stream rather than as an HTTP status: `{"type":"error","error":{...,"statusCode":N,"isRetryable":B}}`. The proxy takes that status (a leading `<NNN>` in the message wins over it, matching the CLI) and maps it the same way as an HTTP-level error — a declared 402 still surfaces as 429 — so an upstream-declared 400 or 429 reaches the client with its own status instead of a blanket 502.
 
 ## Model List
 
