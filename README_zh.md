@@ -6,7 +6,7 @@
 
 逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
-**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志 | Anthropic 服务端搜索（`web_search_20250305` → Command Code 自带的 `/alpha/web-search`，可选开启）
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -66,6 +66,7 @@ commandcode/
 | `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
 | `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
 | `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
+| `webSearch` | `false` | 由代理经 Command Code 的 `/alpha/web-search` 执行 Anthropic 服务端工具 `web_search_20250305`，见下文「Web search」一节 |
 
 ### 环境变量
 
@@ -90,6 +91,8 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
+| `CC_WEB_SEARCH` | 关 | `1` 开启：由代理经 Command Code 的 `/alpha/web-search` 执行 Anthropic 服务端工具 `web_search_20250305`，见下文「Web search」一节 → `webSearch` |
+| `CC_WEB_SEARCH_TIMEOUT_MS` | `8000` | 单次 `/alpha/web-search` 调用超时（毫秒）|
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -281,6 +284,32 @@ data: {"type":"message_stop"}
   }
 }
 ```
+
+#### Web search（Anthropic 服务端工具）
+
+Claude Code 的 WebSearch——以及任何声明了 `{"type": "web_search_20250305", "name": "web_search"}` 的
+Anthropic 客户端——依赖的是由 Anthropic 服务器执行的**服务端工具**。经 Command Code 上游时没有人执行它，
+所以代理现在默认**剥掉** Anthropic 服务端工具（`web_search_20250305`、`web_fetch_20250910`），而不是把它
+压成一个没有 schema、模型用不了的 function tool 转发出去。
+
+设置 `CC_WEB_SEARCH=1` 后，代理自己代为执行 `web_search`，调的是 Command Code 自带的 `/alpha/web-search`
+端点——官方 CLI 内置搜索用的同一个端点、同一把 key：
+
+```text
+模型发出 web_search{query} → 代理 POST /alpha/web-search → 结果以 server_tool_use + web_search_tool_result
+块流式回给客户端 → 调用/结果对追加进历史、重发上游 → 模型在同一条消息里续写
+```
+
+- 线格完全对齐 Anthropic：`server_tool_use`、`input_json_delta`、`web_search_tool_result`（`web_search_result`
+  列表或 `web_search_tool_result_error`），以及最终 `message_delta` 里的 `usage.server_tool_use.web_search_requests`。
+  Claude Code 会按原生的 `Web Search(...)` / `Did N searches` 渲染。
+- 遵守 `max_uses`。额度用完后模型收到 `max_uses_exceeded` 结果，且该工具在后续轮次被移出定义
+  （Command Code 的 `tool_choice` 没有 `none`）；模型若仍持续调用，代理会本地收尾，保证一定发出 `message_stop`。
+- 历史里上一轮的 `server_tool_use` / `web_search_tool_result` 块会被回放成 tool call / tool result 消息，多轮对话不受影响。
+- 结果来自 Command Code 的搜索后端（DuckDuckGo），赞助结果已过滤；`allowed_domains` / `blocked_domains` 按 hostname 生效。
+- 仅流式；非流式 `/v1/messages` 请求仍会剥掉服务端工具。`web_fetch_20250910` 未实现（Claude Code 的 Fetch 在客户端执行，不依赖它）。
+- 每次搜索消耗一次 `/alpha/web-search` 调用外加一轮额外的 `/alpha/generate`，都计入你的 Command Code 配额；配置了 `CC_UPSTREAM_PROXY` 时同样经代理发出。
+  单次搜索超时：`CC_WEB_SEARCH_TIMEOUT_MS`（默认 `8000`）。
 
 ### `POST /v1/responses`
 

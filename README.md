@@ -6,7 +6,7 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging | Anthropic server-side web search (`web_search_20250305` → Command Code's own `/alpha/web-search`, opt-in)
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -66,6 +66,7 @@ commandcode/
 | `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
 | `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
 | `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
+| `webSearch` | `false` | Serve the Anthropic server tool `web_search_20250305` via Command Code's `/alpha/web-search` (see [Web search](#web-search-anthropic-server-tool)) |
 
 ### Environment Variables
 
@@ -90,6 +91,8 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
+| `CC_WEB_SEARCH` | off | `1` serves the Anthropic server tool `web_search_20250305` via Command Code's `/alpha/web-search`; see [Web search](#web-search-anthropic-server-tool) → `webSearch` |
+| `CC_WEB_SEARCH_TIMEOUT_MS` | `8000` | Timeout for one `/alpha/web-search` call (ms) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -283,6 +286,42 @@ data: {"type":"message_stop"}
   }
 }
 ```
+
+#### Web search (Anthropic server tool)
+
+Claude Code's WebSearch — and any Anthropic client that declares
+`{"type": "web_search_20250305", "name": "web_search"}` — relies on a **server-side** tool that
+Anthropic's API executes. Behind Command Code nothing executes it, so by default the proxy now
+**strips** Anthropic server tools (`web_search_20250305`, `web_fetch_20250910`) instead of forwarding
+them as a schema-less function tool the model cannot use.
+
+Set `CC_WEB_SEARCH=1` and the proxy serves `web_search` itself through Command Code's own
+`/alpha/web-search` endpoint — the same one the official CLI's built-in search calls, with the same
+API key:
+
+```text
+model emits web_search{query} → proxy POSTs /alpha/web-search → results are streamed back as
+server_tool_use + web_search_tool_result blocks → the call/result pair is appended to the history
+and the request is re-sent upstream → the model continues in the same message
+```
+
+- Anthropic-shaped on the wire: `server_tool_use`, `input_json_delta`, `web_search_tool_result`
+  (`web_search_result` items or `web_search_tool_result_error`), and
+  `usage.server_tool_use.web_search_requests` in the final `message_delta`. Claude Code renders it as
+  its native `Web Search(...)` / `Did N searches`.
+- `max_uses` is honoured. Once exhausted the model receives a `max_uses_exceeded` result and the tool
+  is removed from the definition for the remaining rounds (Command Code's `tool_choice` has no
+  `none`); if the model keeps calling anyway, the proxy finalizes the stream locally so
+  `message_stop` is always emitted.
+- Prior-turn `server_tool_use` / `web_search_tool_result` blocks in the history are replayed as tool
+  call / tool result messages, so multi-turn conversations keep working.
+- Results come from Command Code's search backend (DuckDuckGo). Sponsored results are filtered out;
+  `allowed_domains` / `blocked_domains` are applied on hostnames.
+- Streaming only — a non-streaming `/v1/messages` request still has server tools stripped.
+  `web_fetch_20250910` is not implemented (Claude Code's Fetch runs client-side and does not need it).
+- Each search costs one `/alpha/web-search` call plus one extra `/alpha/generate` round against your
+  Command Code quota, and goes through `CC_UPSTREAM_PROXY` when one is configured. Per-search timeout:
+  `CC_WEB_SEARCH_TIMEOUT_MS` (default `8000`).
 
 ### `POST /v1/responses`
 
