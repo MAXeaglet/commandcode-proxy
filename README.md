@@ -292,6 +292,7 @@ The request side is translated: `input` (message array; items may omit `type`), 
 `response.created` / `response.in_progress` / `response.output_item.added|done` / `response.content_part.added|done` / `response.output_text.delta|done` / `response.reasoning_summary_text.delta|done` / `response.function_call_arguments.delta|done`, terminated by `response.completed` (`response.incomplete` when truncated by `max_output_tokens`, `response.failed` on error).
 
 - **Stateless**: `previous_response_id` is not supported and answers `400` — send the full `input` every turn (the proxy stores no conversation history).
+- **Multimodal images**: an `input_image` part on a `message` is carried through as a user-role image. An image inside a `function_call_output` cannot stay there — the CC wire format has no image slot on a tool result — so it is lifted into a `user` message right after that tool result. Tool results without images are left unchanged.
 - Errors use the Responses shape: `{"error":{"message":...,"type":...}}`.
 - Shares the same upstream call path, cache breakpoints and idle watchdog as `/v1/chat/completions`.
 
@@ -299,6 +300,18 @@ The request side is translated: `input` (message array; items may omit `type`), 
 curl http://127.0.0.1:3050/v1/responses \
   -H "Authorization: Bearer user_xxxxxxxxx" -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
+```
+
+An image request (vision model required):
+
+```json
+{
+  "model": "xiaomi/mimo-v2.5",
+  "input": [{ "role": "user", "content": [
+    { "type": "input_text", "text": "Describe this image" },
+    { "type": "input_image", "image_url": "data:image/jpeg;base64,..." }
+  ]}]
+}
 ```
 
 ### `GET /v1/models`
@@ -494,7 +507,7 @@ The CLI sends images in this format:
 }
 ```
 
-The proxy receives OpenAI `image_url` format and converts it to the above CC format transparently.
+The proxy receives OpenAI `image_url` format and converts it to the above CC format transparently. An image can only sit on a `user` message: a tool result is text-only in this wire format (see the `function_call_output` note under [`POST /v1/responses`](#post-v1responses)).
 
 ## Docker Deployment
 
