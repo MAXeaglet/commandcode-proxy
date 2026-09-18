@@ -290,6 +290,7 @@ OpenAI **Responses API**（Codex、以及新版 OpenAI SDK 用的那套）。
 `response.created` / `response.in_progress` / `response.output_item.added|done` / `response.content_part.added|done` / `response.output_text.delta|done` / `response.reasoning_summary_text.delta|done` / `response.function_call_arguments.delta|done`，收尾是 `response.completed`（被 `max_output_tokens` 截断时为 `response.incomplete`，出错为 `response.failed`）。
 
 - **无状态**：`previous_response_id` 不支持，传了直接 `400` —— 每轮把完整 `input` 发过来即可（代理不存会话历史）。
+- **多模态图片**：`message` 上的 `input_image` 部件按用户槽图片透传。`function_call_output` 里的图留不住——CC 线格式在工具结果上没有图片槽位——会被抬到该工具结果之后的一条 `user` 消息里；无图的工具结果原样不动。
 - 错误体是 Responses 风格：`{"error":{"message":...,"type":...}}`。
 - 与 `/v1/chat/completions` 共用同一套上游调用、缓存断点与空闲看门狗。
 
@@ -297,6 +298,18 @@ OpenAI **Responses API**（Codex、以及新版 OpenAI SDK 用的那套）。
 curl http://127.0.0.1:3050/v1/responses \
   -H "Authorization: Bearer user_xxxxxxxxx" -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
+```
+
+带图的请求（需视觉模型）：
+
+```json
+{
+  "model": "xiaomi/mimo-v2.5",
+  "input": [{ "role": "user", "content": [
+    { "type": "input_text", "text": "描述这张图" },
+    { "type": "input_image", "image_url": "data:image/jpeg;base64,..." }
+  ]}]
+}
 ```
 
 ### `GET /v1/models`
@@ -492,7 +505,7 @@ CLI 发送图片的格式：
 }
 ```
 
-代理收到 OpenAI `image_url` 格式后自动转为上述 CC 格式透传。
+代理收到 OpenAI `image_url` 格式后自动转为上述 CC 格式透传。图片只能挂在 `user` 消息上：工具结果在这条线格式里只有文本（见 [`POST /v1/responses`](#post-v1responses) 下的 `function_call_output` 说明）。
 
 ## Docker 部署
 

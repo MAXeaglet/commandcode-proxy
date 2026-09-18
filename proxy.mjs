@@ -2641,6 +2641,53 @@ function newResponsesId(prefix) {
   return prefix + randomUUID().replace(/-/g, '').slice(0, 24);
 }
 
+/** `input_image` 部件（含省略 type 只带 image_url 的写法）。 */
+function isResponsesImagePart(part) {
+  return !!part && typeof part === 'object' && (part.type === 'input_image' || part.image_url !== undefined);
+}
+
+/** Responses 的图 → Chat 的 `image_url` 部件（对象形的 image_url，CC 侧读 `.url`）。 */
+function responsesImagePartsOf(parts) {
+  if (!Array.isArray(parts)) return [];
+  return parts.filter(isResponsesImagePart).map(part => {
+    const raw = part.image_url !== undefined ? part.image_url : part.input_image;
+    const url = typeof raw === 'string' ? raw : (raw && raw.url) || '';
+    return url ? { type: 'image_url', image_url: { url } } : null;
+  }).filter(Boolean);
+}
+
+/** 非文本工具结果有的客户端发数组、有的发 JSON 字符串（Codex 发后者）。 */
+function parseJsonArray(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('[')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch { return null; }
+}
+
+/**
+ * 工具结果 → `{ text, images }`。上游只收 user 角色上的图，工具槽里的图必须抬走，
+ * 否则要么被拒、要么被悄悄丢掉（实测两种都出现过）。无图时**原样保留**容器
+ * （字符串还是字符串、数组仍 JSON.stringify），避免无意义的改写。
+ */
+function splitToolOutputImageParts(output) {
+  if (typeof output === 'string') {
+    const parsed = parseJsonArray(output);
+    if (!parsed) return { text: output, images: [] };
+    const images = responsesImagePartsOf(parsed);
+    if (!images.length) return { text: output, images: [] };
+    return { text: JSON.stringify(parsed.filter(p => !isResponsesImagePart(p))), images };
+  }
+  if (Array.isArray(output)) {
+    const images = responsesImagePartsOf(output);
+    if (!images.length) return { text: JSON.stringify(output), images: [] };
+    return { text: JSON.stringify(output.filter(p => !isResponsesImagePart(p))), images };
+  }
+  return { text: JSON.stringify(output === undefined ? '' : output), images: [] };
+}
+
 function convertResponsesToChat(respReq) {
   const messages = [];
 
@@ -2662,6 +2709,21 @@ function convertResponsesToChat(respReq) {
     pending = null;
   };
 
+  // 工具槽里的图抬到紧随其后的一条 user 消息上（上游只收 user 角色上的图）。
+  // 不能见一条 tool 结果就插一条 user 消息：CC 要求 tool 消息紧跟发起它的
+  // assistant 回合，中途插话会打断 call_id 邻接，故攒到下一个非工具结果项再落。
+  let toolImages = [];
+  let toolImageLabel = '';
+  const flushToolImages = () => {
+    if (!toolImages.length) return;
+    messages.push({
+      role: 'user',
+      content: [{ type: 'text', text: toolImageLabel || '[tool result image]' }, ...toolImages],
+    });
+    toolImages = [];
+    toolImageLabel = '';
+  };
+
   const input = respReq.input;
   if (typeof input === 'string') {
     messages.push({ role: 'user', content: input });
@@ -2674,7 +2736,10 @@ function convertResponsesToChat(respReq) {
       // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
       // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
       // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
-      switch (item.type ?? (item.role ? 'message' : undefined)) {
+      const kind = item.type ?? (item.role ? 'message' : undefined);
+      // 攒着的工具图在这里落一条 user 消息，保证它排在下一个非工具结果项之前
+      if (kind !== 'function_call_output') flushToolImages();
+      switch (kind) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -2682,11 +2747,19 @@ function convertResponsesToChat(respReq) {
         }
         case 'message': {
           const text = responsesTextOf(item.content);
+          const images = responsesImagePartsOf(item.content);
           if (item.role === 'assistant') {
+            // assistant 消息上的图没有落点：Chat 的 assistant 内容只有文本槽
             if (text) ensurePending().content = text;
           } else if (item.role === 'system' || item.role === 'developer') {
             flushPending();
             messages.push({ role: 'system', content: text });
+          } else if (images.length) {
+            flushPending();
+            messages.push({
+              role: 'user',
+              content: [...(text ? [{ type: 'text', text }] : []), ...images],
+            });
           } else {
             flushPending();
             messages.push({ role: 'user', content: text });
@@ -2703,11 +2776,16 @@ function convertResponsesToChat(respReq) {
         }
         case 'function_call_output': {
           flushPending();
+          const { text: toolText, images } = splitToolOutputImageParts(item.output);
           messages.push({
             role: 'tool',
             tool_call_id: item.call_id || '',
-            content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output === undefined ? '' : item.output),
+            content: toolText,
           });
+          if (images.length) {
+            toolImages.push(...images);
+            if (!toolImageLabel) toolImageLabel = `[tool result image: ${item.call_id || 'unknown'}]`;
+          }
           break;
         }
         default: {
@@ -2718,6 +2796,7 @@ function convertResponsesToChat(respReq) {
     }
   }
   flushPending();
+  flushToolImages();
 
   let tools;
   if (Array.isArray(respReq.tools) && respReq.tools.length) {
