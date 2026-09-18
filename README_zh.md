@@ -406,7 +406,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 |------|------|
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
 | **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`）|
-| **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
+| **Session ID** | 客户端带了 session 类 header 时直接用（`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`）；否则**按请求内容确定性派生** —— `sha1(apiKey + model + system + 首个非 user 消息之前的连续 user 文本)` 格式化成 UUID。|
 | **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.53.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
 | **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
@@ -660,7 +660,8 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 
 - **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
 - **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
-- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
+- **按内容派生的 session id**：客户端不带 session header 时，id 是 `apiKey + model + system + 首个非 user 消息之前的连续 user 文本` 的哈希 —— 这段前缀里任何变化（system 里带当天日期、中途换 model）都会让同一场对话中途换 id，进而导致缓存重建。需要精确控制时请由客户端下发 `x-session-id` 或 `prompt_cache_key`。
+- **多账号 + 多实例**：唯一的进程内状态只剩 `keyStateStore`（每 key 一份确定性指纹 + 初始化节流）。同一个 API key 打到两个实例，报告的设备指纹与 session id 都是**同一个** —— 前提是各实例的 `CC_FINGERPRINT_SALT` 与 `CC_DEVICE_PROJECT_DIR` 保持一致，否则指纹会分叉。只有 fingerprint/lifecycle 预请求的节流是各实例独立的，所以两个实例可能落在同一时间窗内各发一轮初始化。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
 
 ## 免责声明
 

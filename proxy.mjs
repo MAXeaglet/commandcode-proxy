@@ -287,45 +287,38 @@ function summarizeUpstreamError(text, limit = 500) {
   return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
-// ── 会话管理 ───────────────────────────────────────
-// 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
-// 同一 Key 在同一周期内复用，到期自动换新
-const SESSION_DURATION_MS = 12 * 60 * 60 * 1000;    // 12h
-const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
-
-const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
-
-function ensureSession(apiKey) {
-  const now = Date.now();
-  const entry = sessionStore.get(apiKey);
-
-  if (entry && now < entry.expiresAt) {
-    return entry.sessionId;
-  }
-
-  // 过期或第一次：生成新 session
-  const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
-  const sessionId = randomUUID();
-  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
-      log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
-  return sessionId;
-}
-
-// 定期清理过期 session 和 key 状态，防止 Map 无限增长
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [key, entry] of sessionStore) {
-    if (now >= entry.expiresAt) {
-      sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
-      cleaned++;
+/**
+ * 按请求内容派生 UUID：apiKey + model + system + 首个非 user 消息之前的连续 user 文本。
+ * @param {string} apiKey 上游账号 key
+ * @param {CcRequestBody} ccBody buildCcRequest 的返回值
+ * @returns {string} UUID 字符串
+ */
+function deriveSessionId(apiKey, ccBody) {
+  const params = (ccBody && ccBody.params) || {};
+  // 逐块喂入，'\0'分隔
+  const h = crypto.createHash('sha1');
+  h.update(apiKey || '').update('\0');
+  h.update(params.model || '').update('\0');
+  if (Array.isArray(params.system)) {
+    for (const b of params.system || []) {
+      if (b && typeof b.text === 'string') h.update(b.text).update('\0');
     }
   }
-  if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000); // 每小时
+  for (const msg of params.messages || []) {
+    if (msg.role !== 'user') break; // assistant / tool 起始后的输入不参与派生
+    if (!Array.isArray(msg.content)) continue;
+    for (const p of msg.content) {
+      if (p.type === 'text' && typeof p.text === 'string') h.update(p.text).update('\0');
+    }
+  }
+  const bytes = h.digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; 
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
-function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
+function getSessionId(incomingHeaders, apiKey, promptCacheKey, ccBody) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
@@ -336,8 +329,8 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
   }
-  // 按 API Key 分 session
-  return ensureSession(apiKey);
+  // 客户端未提供会话标识时按请求内容派生
+  return deriveSessionId(apiKey, ccBody);
 }
 
 // 每个请求独立 thread ID
@@ -488,6 +481,79 @@ function getDateStr() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
+/**
+ * params.system 的块形态（toWireSystem），非末块补 \n，可带缓存断点。
+ * @typedef {Object} CcSystemBlock
+ * @property {'text'} type
+ * @property {string} text
+ * @property {{ type: 'ephemeral' }} [cache_control]
+ */
+
+/**
+ * messages 里的内容块联合类型：text / image / reasoning / tool-call / tool-result。
+ * @typedef {Object} CcTextPart
+ * @property {'text'} type
+ * @property {string} text
+ * @property {{ type: 'ephemeral' }} [cache_control]
+ * @typedef {Object} CcImagePart
+ * @property {'image'} type
+ * @property {string} image        // data:<mime>;base64,...
+ * @property {string} [mimeType]
+ * @typedef {Object} CcReasoningPart
+ * @property {'reasoning'} type
+ * @property {string} text
+ * @typedef {Object} CcToolCallPart
+ * @property {'tool-call'} type
+ * @property {string} toolCallId
+ * @property {string} toolName
+ * @property {string|object} input
+ * @typedef {Object} CcToolResultPart
+ * @property {'tool-result'} type
+ * @property {string} toolCallId
+ * @property {string} toolName
+ * @property {{ type: 'text', value: string }} output
+ * @typedef {CcTextPart|CcImagePart|CcReasoningPart|CcToolCallPart|CcToolResultPart} CcContentPart
+ */
+
+/**
+ * wire 格式的单条消息（buildCcRequest 的 ccMessages 元素）。
+ * @typedef {Object} CcMessage
+ * @property {'user'|'assistant'|'tool'} role
+ * @property {CcContentPart[]} content
+ */
+
+/**
+ * 信封 params 块。
+ * @typedef {Object} CcRequestParams
+ * @property {string} model
+ * @property {CcMessage[]} messages
+ * @property {CcSystemBlock[]} [system]
+ * @property {number} max_tokens
+ * @property {true} stream            // CC API 总是 stream
+ * @property {number} [temperature]
+ * @property {string} [reasoning_effort]
+ * @property {{ name: string, description: string, input_schema: object }[]} tools
+ * @property {{ type: 'auto'|'none'|'any'|'tool', name?: string }} [tool_choice]
+ * @property {boolean} [parallel_tool_calls]
+ */
+
+/**
+ * /alpha/generate 的 9 键信封（threadId 由 forwardToCC 重排时插入）。
+ * @typedef {Object} CcRequestBody
+ * @property {{ workingDir: string, date: string, environment: string, structure: string[],
+ *   isGitRepo: boolean, currentBranch: string, mainBranch: string, gitStatus: string,
+ *   recentCommits: string[] }} config
+ * @property {null} memory
+ * @property {null} taste
+ * @property {null} skills
+ * @property {'standard'} permissionMode
+ * @property {string} mode
+ * @property {CcRequestParams} params
+ */
+
+/**
+ * @returns {CcRequestBody}
+ */
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
@@ -1126,7 +1192,7 @@ function getApiKey(headers) {
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey, body);
   // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
   // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
@@ -3313,7 +3379,7 @@ server.listen(CFG.port, CFG.host, () => {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
     models: MODELS.length,
-    session: '12h + 1h jitter, per API key',
+    session: 'content-derived x-session-id',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
     logFile: CFG.logFile || '(console only)',

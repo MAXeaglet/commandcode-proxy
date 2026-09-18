@@ -408,7 +408,7 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
 |-----------|---------------|
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init |
-| **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
+| **Session ID** | Taken from the client header when present (`x-session-id` / `x-claude-code-session-id` / `session_id` / `prompt_cache_key`); otherwise **derived deterministically from the request** — `sha1(apiKey + model + system + user text up to the first non-user message)` formatted as a UUID. |
 | **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.53.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
 | **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
@@ -658,7 +658,8 @@ A more robust cap still belongs at the reverse proxy (`limit_conn`), since only 
 
 - **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
 - **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
-- **Multi-account + multiple instances**: `sessionStore` / `keyStateStore` are per-process `Map`s, so the same API key served by two instances gets two different sessions and **two different device fingerprints** — upstream sees one account on multiple machines. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
+- **Content-derived session id**: without a client-supplied session header the id hashes `apiKey + model + system + user text up to the first non-user message`, so anything that changes inside that prefix — a system prompt carrying today's date, a model switch — gives a different session id mid-conversation, which forces a cache rebuild. Send `x-session-id` or `prompt_cache_key` from the client when you need exact control.
+- **Multi-account + multiple instances**: the only per-process state left is `keyStateStore` (a deterministic fingerprint plus an init throttle per key). The same API key served by two instances therefore reports the **same** device fingerprint and the **same** session id — provided `CC_FINGERPRINT_SALT` and `CC_DEVICE_PROJECT_DIR` are identical on both, or the fingerprints diverge. Only the fingerprint/lifecycle pre-request timing is per-instance, so two instances may each send one init round inside the same window. When scaling out, use consistent hashing on the API key (`hash $cc_key consistent`) rather than round-robin.
 
 ## Disclaimer
 
