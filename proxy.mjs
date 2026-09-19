@@ -32,6 +32,7 @@ function loadConfig() {
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    webSearch: false, // Claude Code 的 web_search_20250305 服务端工具：默认剥掉；true 时由本 proxy 调 CC 的 /alpha/web-search 代为执行（CC_WEB_SEARCH=1）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -58,6 +59,7 @@ function loadConfig() {
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+  if (process.env.CC_WEB_SEARCH !== undefined) defaults.webSearch = process.env.CC_WEB_SEARCH === '1';
 
   return defaults;
 }
@@ -1312,6 +1314,110 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   return response;
 }
 
+// ── Web search（CC 自带的 /alpha/web-search）─────────────────────
+// 官方 CLI 内置的 web_search 打的就是这个端点，同一把 key。
+//   请求  { query: string, numResults: 1-10 }
+//   响应  { query, results: [{ title, url, snippet }], formatted }
+// 后端是 DuckDuckGo，且不过滤赞助结果（duckduckgo.com/y.js?...&ad_type=txad，单条 URL 2KB+），
+// 这里剥掉广告后再喂模型 / 回给客户端，所以不直接用上游的 formatted。
+const WEB_SEARCH_ROUTE = '/alpha/web-search';
+const WEB_SEARCH_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_WEB_SEARCH_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 8000;
+})();
+const WEB_SEARCH_AD_RE = /duckduckgo\.com\/y\.js|[?&]ad_type=|[?&]ad_provider=/i;
+
+function hostnameOf(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch { return ''; }
+}
+function domainMatches(hostname, domain) {
+  const d = String(domain || '').toLowerCase().replace(/^\*\./, '');
+  return !!d && (hostname === d || hostname.endsWith('.' + d));
+}
+
+// 返回 { blocks, textForModel } 或 { errorCode }。errorCode 对齐 Anthropic 的
+// web_search_tool_result_error：too_many_requests / invalid_input / max_uses_exceeded / unavailable。
+async function executeWebSearch(query, apiKey, incomingHeaders = {}, signal, opts = {}) {
+  if (typeof query !== 'string' || !query.trim()) return { errorCode: 'invalid_input' };
+  const want = Math.max(1, Math.min(10, Number.isInteger(opts.numResults) ? opts.numResults : 5));
+
+  // 头与 forwardToCC 完全一致（CLI 对 generate / web-search 用同一套 buildCommandAuthHeaders）
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'cli',
+    'x-command-code-version': CC_VERSION,
+    'x-cli-environment': 'production',
+    'x-project-slug': slugifyProjectPath(DEVICE_PROFILE.projectDir),
+    'x-taste-learning': 'false',
+    'x-session-id': getSessionId(incomingHeaders, apiKey),
+    'Authorization': `Bearer ${apiKey}`,
+    'traceparent': generateTraceparent(),
+  };
+  if (CFG.zdr || incomingHeaders['x-cmd-zdr'] === '1') headers['x-cmd-zdr'] = '1';
+
+  const timeout = AbortSignal.timeout(WEB_SEARCH_TIMEOUT_MS);
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+
+  let data;
+  try {
+    // 经 upstreamFetch：配置了 CC_UPSTREAM_PROXY 时与 generate 一样走代理（issue #18）
+    const r = await upstreamFetch(`${CFG.apiBase}${WEB_SEARCH_ROUTE}`, {
+      method: 'POST',
+      headers,
+      signal: combined,
+      // 多要几条抵消被剥掉的广告
+      body: JSON.stringify({ query: query.trim(), numResults: Math.min(10, want + 3) }),
+    });
+    if (!r.ok) {
+      log('warn', 'Web search upstream error', { status: r.status });
+      return { errorCode: r.status === 429 ? 'too_many_requests' : 'unavailable' };
+    }
+    data = await r.json();
+  } catch (e) {
+    if (signal?.aborted) throw e; // 客户端断连，交给上层收尾
+    log('warn', 'Web search failed', { message: e.message, timedOut: timeout.aborted });
+    return { errorCode: 'unavailable' };
+  }
+  if (!Array.isArray(data?.results)) return { errorCode: 'unavailable' };
+
+  const results = data.results
+    .filter(x => x && typeof x.url === 'string' && x.url && !WEB_SEARCH_AD_RE.test(x.url))
+    .filter(x => {
+      const h = hostnameOf(x.url);
+      if (opts.allowedDomains?.length && !opts.allowedDomains.some(d => domainMatches(h, d))) return false;
+      if (opts.blockedDomains?.length && opts.blockedDomains.some(d => domainMatches(h, d))) return false;
+      return true;
+    })
+    .slice(0, want);
+
+  // encrypted_content 是 Anthropic 加密的正文，客户端只透传；这里放自编码的摘要，
+  // 只有本 proxy 回放历史时读（decodeWebSearchResultBlocks）。
+  const blocks = results.map(x => ({
+    type: 'web_search_result',
+    url: x.url,
+    title: x.title || '',
+    encrypted_content: Buffer.from(JSON.stringify({ s: x.snippet || '' }), 'utf8').toString('base64'),
+    page_age: null,
+  }));
+  const textForModel = `Search results for: ${query.trim()}\n\n` + (results.length
+    ? results.map((x, i) => `${i + 1}. **${x.title || x.url}**\n   ${x.url}\n   ${x.snippet || ''}`).join('\n\n')
+    : '(no results)');
+  return { blocks, textForModel };
+}
+
+// 历史回放：把客户端原样带回的 web_search_tool_result.content 还原成模型可读文本
+function decodeWebSearchResultBlocks(content) {
+  if (!Array.isArray(content)) {
+    return `Search failed: ${content?.error_code || 'unavailable'}`;
+  }
+  if (content.length === 0) return '(no results)';
+  return content.map((x, i) => {
+    let snippet = '';
+    try { snippet = JSON.parse(Buffer.from(String(x.encrypted_content || ''), 'base64').toString('utf8')).s || ''; } catch {}
+    return `${i + 1}. **${x.title || x.url || ''}**\n   ${x.url || ''}\n   ${snippet}`;
+  }).join('\n\n');
+}
+
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
@@ -1797,6 +1903,23 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
   };
 }
 
+// Anthropic 服务端工具的 type → 内部种类。这类工具没有 input_schema，由 Anthropic 服务器执行；
+// 经 CC 上游时只能由本 proxy 代为执行（web_search 已实现，见 executeWebSearch）或剥掉。
+const SERVER_TOOL_TYPES = {
+  web_search_20250305: 'web_search',
+  web_fetch_20250910: 'web_fetch',
+};
+const DEFAULT_WEB_SEARCH_MAX_USES = 5;
+const strippedServerToolWarned = new Set();
+function warnServerToolStripped(type) {
+  if (strippedServerToolWarned.has(type)) return;
+  strippedServerToolWarned.add(type);
+  log('info', 'Stripped Anthropic server tool (not executable via CC upstream)', {
+    type,
+    hint: type === 'web_search_20250305' ? 'set CC_WEB_SEARCH=1 to serve it via /alpha/web-search' : undefined,
+  });
+}
+
 function convertAnthropicToOpenAI(anthropicReq) {
   // 1. Extract system prompt (top-level, not in messages array)
   let systemPrompt = '';
@@ -1828,13 +1951,26 @@ function convertAnthropicToOpenAI(anthropicReq) {
   const messages = anthropicReq.messages || [];
   for (const msg of messages) {
     if (msg.role === 'assistant') {
+      // 一条 Anthropic assistant 消息可能内含 [text?, server_tool_use, web_search_tool_result, text]
+      //（本 proxy 上一轮代执行搜索后回给客户端、客户端原样带回的形态）。OpenAI 语义要求拆成
+      // assistant{tool_calls} → tool{result} → assistant{text}，所以遇到搜索结果块时先 flush。
       let textContent = '';
       // Anthropic 的 thinking block 承载思考内容，需转成 reasoning_content
       // 交给 buildCcRequest 回传，否则 CC 会因缺少 reasoning 而拒绝
       let thinkingContent = '';
-      const textParts = [];
+      let textParts = [];
       let textHasCache = false;
-      const toolCalls = [];
+      let toolCalls = [];
+      let pushedAny = false;
+      const flushAssistant = () => {
+        if (!textParts.length && !thinkingContent && !toolCalls.length) return;
+        const assistantMsg = { role: 'assistant', content: (textParts.length > 1 || textHasCache) ? textParts : (textContent || null) };
+        if (thinkingContent) assistantMsg.reasoning_content = thinkingContent;
+        if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+        openaiMessages.push(assistantMsg);
+        pushedAny = true;
+        textContent = ''; thinkingContent = ''; textParts = []; textHasCache = false; toolCalls = [];
+      };
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }];
       for (const block of blocks) {
         if (block.type === 'text') {
@@ -1844,7 +1980,8 @@ function convertAnthropicToOpenAI(anthropicReq) {
           textParts.push(part);
         } else if (block.type === 'thinking') {
           thinkingContent += block.thinking || '';
-        } else if (block.type === 'tool_use') {
+        } else if (block.type === 'tool_use' || block.type === 'server_tool_use') {
+          // server_tool_use = 本 proxy 上一轮代执行的搜索调用，回放成普通 tool_call
           toolNameFromId[block.id] = block.name;
           toolCalls.push({
             id: block.id,
@@ -1854,12 +1991,20 @@ function convertAnthropicToOpenAI(anthropicReq) {
               arguments: JSON.stringify(block.input || {}),
             },
           });
+        } else if (block.type === 'web_search_tool_result') {
+          flushAssistant();
+          openaiMessages.push({
+            role: 'tool',
+            tool_call_id: block.tool_use_id,
+            name: toolNameFromId[block.tool_use_id] || 'web_search',
+            content: decodeWebSearchResultBlocks(block.content),
+          });
+          pushedAny = true;
         }
       }
-      const assistantMsg = { role: 'assistant', content: (textParts.length > 1 || textHasCache) ? textParts : (textContent || null) };
-      if (thinkingContent) assistantMsg.reasoning_content = thinkingContent;
-      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-      openaiMessages.push(assistantMsg);
+      flushAssistant();
+      // 保持原行为：空 assistant 消息也推一条 content:null（不能在 tool 消息后多推一条空的）
+      if (!pushedAny) openaiMessages.push({ role: 'assistant', content: null });
     } else if (msg.role === 'user') {
       let textContent = '';
       // parts 保持原始顺序（text / image_url），与 CLI 的 toWireMessages 一致
@@ -1920,15 +2065,52 @@ function convertAnthropicToOpenAI(anthropicReq) {
   };
 
   // 4. Map tools
+  // Anthropic 服务端工具（web_search_20250305 等）没有 input_schema，原实现会把它压成一个
+  // 无描述、空参数的 function tool 喂给模型（模型要么不用，要么瞎调后客户端找不到处理器）。
+  // 现在：默认剥掉；CC_WEB_SEARCH=1 时把 web_search 改写成带真实 schema 的 function tool，
+  // 并把 max_uses / 域名限制记到 openaiReq._serverTools，由 handleMessages 的搜索循环消费。
   if (anthropicReq.tools && anthropicReq.tools.length > 0) {
-    openaiReq.tools = anthropicReq.tools.map(t => ({
-      type: 'function',
-      function: {
-        name: t.name,
-        description: t.description || '',
-        parameters: t.input_schema || { type: 'object', properties: {} },
-      },
-    }));
+    const serverTools = {};
+    const mapped = [];
+    for (const t of anthropicReq.tools) {
+      const serverKind = SERVER_TOOL_TYPES[t.type];
+      if (serverKind) {
+        if (!CFG.webSearch || serverKind !== 'web_search') {
+          warnServerToolStripped(t.type);
+          continue;
+        }
+        serverTools[t.name] = {
+          kind: serverKind,
+          maxUses: Number.isInteger(t.max_uses) && t.max_uses > 0 ? t.max_uses : DEFAULT_WEB_SEARCH_MAX_USES,
+          allowedDomains: Array.isArray(t.allowed_domains) && t.allowed_domains.length ? t.allowed_domains : null,
+          blockedDomains: Array.isArray(t.blocked_domains) && t.blocked_domains.length ? t.blocked_domains : null,
+          used: 0,
+        };
+        mapped.push({
+          type: 'function',
+          function: {
+            name: t.name,
+            description: 'Search the web for current information. Returns a numbered list of results with title, URL and snippet. Use it when the answer depends on recent events or facts you are not certain about.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string', description: 'The search query' } },
+              required: ['query'],
+            },
+          },
+        });
+        continue;
+      }
+      mapped.push({
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description || '',
+          parameters: t.input_schema || { type: 'object', properties: {} },
+        },
+      });
+    }
+    if (mapped.length > 0) openaiReq.tools = mapped;
+    if (Object.keys(serverTools).length > 0) openaiReq._serverTools = serverTools;
   }
 
   // 5. Map tool_choice
@@ -1974,7 +2156,8 @@ function convertAnthropicToOpenAI(anthropicReq) {
  * Anthropic SSE events for streaming.
  */
 async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
-  let nextBlockIndex = 0;
+  // 搜索循环会用多个翻译器实例续写同一条消息：块索引从 ctx 接续，结束时写回（见 finally）
+  let nextBlockIndex = ctx.nextBlockIndex ?? 0;
   let currentBlockIndex = -1;
   let currentBlockType = null;
   let blockStarted = false;
@@ -2033,8 +2216,8 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
     return startBlock('thinking', { type: 'thinking', thinking: '' });
   }
 
-  // Emit message_start (always the first event)
-  yield `event: message_start\ndata: ${JSON.stringify({
+  // Emit message_start (always the first event)；搜索循环第 2 轮起由 ctx.suppressMessageStart 抑制
+  if (!ctx.suppressMessageStart) yield `event: message_start\ndata: ${JSON.stringify({
     type: 'message_start',
     message: {
       id: messageId,
@@ -2086,6 +2269,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             if (!text) break;
             const startBlock = startThinkingBlock();
             currentThinkingText += text;
+            if (ctx.serverTools) ctx.thinkingAll = (ctx.thinkingAll || '') + text; // 搜索循环追加历史时回传 reasoning
             yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`;
             hadOutput = true;
             break;
@@ -2097,6 +2281,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
             outputTokens += 1;
             hadOutput = true;
+            if (ctx.serverTools) ctx.roundText = (ctx.roundText || '') + text; // 搜索循环追加历史时保留本轮已发文本
             break;
           }
 
@@ -2108,6 +2293,26 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             const id = event.toolCallId || `toolu_${randomUUID().slice(0, 12)}`;
             const name = event.toolName || '';
             const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
+
+            // 服务端工具（web_search）：不当客户端 tool_use 下发——客户端没有它的处理器——
+            // 改发 Anthropic 的 server_tool_use 块，并登记到 ctx.pendingSearches 交给
+            // handleMessages 的搜索循环执行。本轮不终结消息（见 finalize 处的早退）。
+            if (ctx.serverTools && ctx.serverTools[name]) {
+              const srvId = 'srvtoolu_' + randomUUID().slice(0, 12);
+              const srvIndex = nextBlockIndex++;
+              yield `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: srvIndex, content_block: { type: 'server_tool_use', id: srvId, name, input: {} } })}\n\n`;
+              yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: srvIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`;
+              yield `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: srvIndex })}\n\n`;
+              outputTokens += 20;
+              hadOutput = true;
+              (ctx.pendingSearches ||= []).push({
+                id: srvId,                                    // 发给客户端的 id（回放时客户端原样带回）
+                name,
+                input: tryParseJSON(input),
+                upstreamToolCallId: event.toolCallId || srvId, // 追加历史时对齐上游生成的 id
+              });
+              break;
+            }
 
             const tcIndex = nextBlockIndex++;
             yield `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`;
@@ -2177,6 +2382,17 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       const closeBlock = closeTextBlock();
       if (closeBlock) yield closeBlock;
 
+      // 搜索循环：本轮有待执行的服务端工具调用 → 不发 message_delta / message_stop，
+      // 把本轮 usage 累进 ctx.usageCarry，由 handleMessages 执行搜索后开下一轮续写。
+      if (ctx.pendingSearches && ctx.pendingSearches.length) {
+        const c = (ctx.usageCarry ||= { input: 0, output: 0, cached: 0, cacheWrite: 0 });
+        c.input += noCacheTokens >= 0 ? noCacheTokens : Math.max(0, inputTokens - cachedInputTokens - (cacheWriteTokens || 0));
+        c.output += outputTokens;
+        c.cached += cachedInputTokens;
+        c.cacheWrite += cacheWriteTokens || 0;
+        return;
+      }
+
       // 上游没有正常走完 finish（无 finish 事件 / provider 报连接失败）：
       // 绝不能补一个 end_turn 就 message_stop —— 那等于把截断谎报成完整回答。
       // 对齐 CLI：这一族一律按可重试错误处理。
@@ -2188,24 +2404,29 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       } else if (outputTokens === 0) {
         yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
       } else {
+        // 搜索循环：前几轮的 usage 记在 ctx.usageCarry，这里一并汇总（下游只看这一条 message_delta 计费）
+        const carry = ctx.usageCarry || { input: 0, output: 0, cached: 0, cacheWrite: 0 };
+        const finalUsage = {
+          output_tokens: outputTokens + carry.output,
+          cache_read_input_tokens: cachedInputTokens + carry.cached,
+          cache_creation_input_tokens: (cacheWriteTokens || 0) + carry.cacheWrite,
+          // 只计非缓存部分；否则下游把 input 与 cache_read 相加会得到约两倍（issue #25）
+          input_tokens: (noCacheTokens >= 0
+            ? noCacheTokens
+            : Math.max(0, inputTokens - cachedInputTokens - (cacheWriteTokens || 0))) + carry.input,
+        };
+        if (ctx.searchCount) finalUsage.server_tool_use = { web_search_requests: ctx.searchCount };
         yield `event: message_delta\ndata: ${JSON.stringify({
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn' },
-          usage: {
-            output_tokens: outputTokens,
-            cache_read_input_tokens: cachedInputTokens,
-            cache_creation_input_tokens: cacheWriteTokens || 0,
-            // 只计非缓存部分；否则下游把 input 与 cache_read 相加会得到约两倍（issue #25）
-            input_tokens: noCacheTokens >= 0
-              ? noCacheTokens
-              : Math.max(0, inputTokens - cachedInputTokens - (cacheWriteTokens || 0)),
-          },
+          usage: finalUsage,
         })}\n\n`;
 
         yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
       }
     }
   } finally {
+    ctx.nextBlockIndex = nextBlockIndex; // 搜索循环下一轮 / 结果块从这里接着编号
     // 确保流中断时通知上游
     idle.dispose();
     try { reader.cancel(); } catch {}
@@ -2247,7 +2468,14 @@ async function handleMessages(req, res) {
 
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
-  const ccBody = buildCcRequest(openaiReq);
+  if (!stream && openaiReq._serverTools) {
+    // 搜索循环只实现了流式（Claude Code 只走流式）；非流式退回剥掉服务端工具
+    const names = new Set(Object.keys(openaiReq._serverTools));
+    openaiReq.tools = (openaiReq.tools || []).filter(t => !names.has(t.function?.name));
+    if (!openaiReq.tools.length) delete openaiReq.tools;
+    delete openaiReq._serverTools;
+  }
+  let ccBody = buildCcRequest(openaiReq); // 搜索循环每轮追加历史后重建
 
   const abortController = new AbortController();
   let aborted = false;
@@ -2334,19 +2562,132 @@ async function handleMessages(req, res) {
       let ctx;
       try {
         messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null };
-        const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
-        for await (const event of generator) {
-          if (aborted) break;
-          if (!started && !event.startsWith('event: message_start')) {
-            await flushBuf();
-          }
+        ctx = {
+          bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null,
+          // 搜索循环状态：serverTools 来自 convertAnthropicToOpenAI；pendingSearches 由翻译器登记
+          serverTools: openaiReq._serverTools || null,
+          pendingSearches: null, usageCarry: null, searchCount: 0, nextBlockIndex: 0,
+          suppressMessageStart: false, thinkingAll: '', roundText: '',
+        };
+        const emit = async (ev) => {
           if (started) {
-            try { res.write(event); } catch {}
+            try { res.write(ev); } catch {}
             lastSentAt = Date.now();
             await waitDrain(res);
           } else {
-            buf.push(event);
+            buf.push(ev);
+          }
+        };
+
+        // ── 服务端工具（web_search）由本 proxy 代执行 ──
+        // 模型发 tool call → 调 CC 的 /alpha/web-search → 结果以 web_search_tool_result 块下发
+        // → 以 tool_calls + tool 消息追加历史、重建 ccBody 重发上游 → 模型续写。每轮一个翻译器实例，
+        // 块索引 / usage 通过 ctx 接续。轮数上限 = 各工具 max_uses 之和 + 1（末轮收尾），再硬性封顶。
+        // 轮数上限 = 各工具 max_uses 之和（硬性封顶 10；模型可能一轮并行调多次，一轮就吃掉多个额度）。
+        // 额度用完后：给模型一轮 max_uses_exceeded 的错误结果，并把该工具移出定义让它物理上不能再调
+        //（CC 的 tool_choice 只有 auto/any/tool，没有 none——真机 400 验证过）；它若还连续再调，
+        // 不再上游，本地补错误块 + 终结事件，保证流一定有 message_stop。
+        const maxSearchRounds = ctx.serverTools
+          ? Math.min(10, Object.values(ctx.serverTools).reduce((s, t) => s + t.maxUses, 0))
+          : 0;
+        let roundResponse = ccResponse;
+        let exhaustedRounds = 0; // 连续"全部 max_uses_exceeded"的轮数
+        // 本地终结：不再上游，用累计 usage 发 message_delta + message_stop
+        const finalizeLocally = async (why) => {
+          const c = ctx.usageCarry || { input: 0, output: 0, cached: 0, cacheWrite: 0 };
+          const usage = { output_tokens: c.output, input_tokens: c.input, cache_read_input_tokens: c.cached, cache_creation_input_tokens: c.cacheWrite };
+          if (ctx.searchCount) usage.server_tool_use = { web_search_requests: ctx.searchCount };
+          await emit(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage })}\n\n`);
+          await emit(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+          log('warn', 'Web search loop finalized locally', { why, id: messageId });
+        };
+        for (let round = 0; ; round++) {
+          ctx.pendingSearches = null;
+          ctx.roundText = '';
+          ctx.thinkingAll = '';
+          ctx.suppressMessageStart = round > 0;
+          const generator = createAnthropicSseTranslator(roundResponse, model, messageId, ctx);
+          for await (const event of generator) {
+            if (aborted) break;
+            if (!started && !event.startsWith('event: message_start')) {
+              await flushBuf();
+            }
+            await emit(event);
+          }
+          if (aborted || !ctx.pendingSearches || !ctx.pendingSearches.length) break;
+
+          if (round > maxSearchRounds) {
+            // 失控保护：轮数封顶。补错误结果块并本地收尾。
+            for (const p of ctx.pendingSearches) {
+              const idx = ctx.nextBlockIndex++;
+              await emit(
+                `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'web_search_tool_result', tool_use_id: p.id, content: { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' } } })}\n\n`
+                + `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`,
+              );
+            }
+            await finalizeLocally(`round cap ${maxSearchRounds} exceeded`);
+            break;
+          }
+
+          const assistantToolCalls = [];
+          const toolMessages = [];
+          for (const p of ctx.pendingSearches) {
+            const tool = ctx.serverTools[p.name];
+            let result;
+            if (tool.used >= tool.maxUses) {
+              result = { errorCode: 'max_uses_exceeded' };
+            } else {
+              tool.used++;
+              ctx.searchCount++;
+              result = await executeWebSearch(p.input?.query, apiKey, req.headers, abortController.signal, {
+                allowedDomains: tool.allowedDomains,
+                blockedDomains: tool.blockedDomains,
+              });
+            }
+            const content = result.errorCode
+              ? { type: 'web_search_tool_result_error', error_code: result.errorCode }
+              : result.blocks;
+            const idx = ctx.nextBlockIndex++;
+            await emit(
+              `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'web_search_tool_result', tool_use_id: p.id, content } })}\n\n`
+              + `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`,
+            );
+            assistantToolCalls.push({ id: p.upstreamToolCallId, type: 'function', function: { name: p.name, arguments: JSON.stringify(p.input || {}) } });
+            toolMessages.push({
+              role: 'tool', tool_call_id: p.upstreamToolCallId, name: p.name,
+              content: result.errorCode ? `Search failed: ${result.errorCode}` : result.textForModel,
+            });
+          }
+          if (aborted) break;
+
+          // 模型拿到 max_uses_exceeded 还连续再调 → 不再上游，本地收尾
+          const allExhausted = toolMessages.length > 0 && toolMessages.every(m => m.content.startsWith('Search failed: max_uses_exceeded'));
+          exhaustedRounds = allExhausted ? exhaustedRounds + 1 : 0;
+          if (exhaustedRounds >= 2) { await finalizeLocally('model kept calling after max_uses_exceeded'); break; }
+
+          // 追加历史：assistant{本轮已发文本 + tool_calls (+ reasoning：CC 在 thinking 模式下校验它随历史带回)} → tool 结果
+          const assistantMsg = { role: 'assistant', content: ctx.roundText || null, tool_calls: assistantToolCalls };
+          if (ctx.thinkingAll) assistantMsg.reasoning_content = ctx.thinkingAll;
+          openaiReq.messages.push(assistantMsg, ...toolMessages);
+          // 额度用完的服务端工具移出定义：模型物理上不能再调，客户端工具不受影响
+          const exhausted = new Set(Object.keys(ctx.serverTools).filter(n => ctx.serverTools[n].used >= ctx.serverTools[n].maxUses));
+          if (exhausted.size && Array.isArray(openaiReq.tools)) {
+            openaiReq.tools = openaiReq.tools.filter(t => !exhausted.has(t.function?.name));
+            const tc = openaiReq.tool_choice;
+            if (tc === 'required' || (tc && typeof tc === 'object' && exhausted.has(tc.function?.name))) openaiReq.tool_choice = 'auto';
+            if (!openaiReq.tools.length) { delete openaiReq.tools; delete openaiReq.tool_choice; }
+          }
+          ccBody = buildCcRequest(openaiReq);
+          log('info', 'Web search round', { round: round + 1, searches: assistantToolCalls.length, removedTools: [...exhausted], id: messageId });
+
+          roundResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+          if (!roundResponse.ok) {
+            const errorText = await roundResponse.text().catch(() => '');
+            const mapped = mapCcError(roundResponse.status, errorText);
+            log('error', 'CC API error (web search round)', { status: roundResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
+            ctx.upstreamError = mapped;
+            await emit(`event: error\ndata: ${JSON.stringify({ type: 'error', error: mapped.body.error })}\n\n`);
+            break;
           }
         }
 
@@ -3464,6 +3805,7 @@ server.listen(CFG.port, CFG.host, () => {
     session: '12h + 1h jitter, per API key',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
+    webSearch: CFG.webSearch ? `on (Anthropic web_search_20250305 served via ${WEB_SEARCH_ROUTE}, timeout ${WEB_SEARCH_TIMEOUT_MS}ms)` : 'off (Anthropic server tools stripped; CC_WEB_SEARCH=1 to enable)',
     logFile: CFG.logFile || '(console only)',
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
     keepAliveTimeout: `${KEEPALIVE_TIMEOUT_MS}ms (反代侧 keepalive_timeout 必须小于它)`,
