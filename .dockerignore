@@ -1,6 +1,10 @@
 node_modules/
-.git/
+**/node_modules/
+frontend/dist/
+secrets/
+*.sqlite*
 *.log
+.git/
 .commandcode/
 .opencode/
 .omo/

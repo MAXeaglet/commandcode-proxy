@@ -2,7 +2,7 @@
 
 > [English Docs](README.md)
 
-将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
+带 Vue 管理控制台的 Command Code 网关，提供 OpenAI / Anthropic 兼容推理接口。网关使用 Node.js 内置模块；前端构建需要依赖。
 
 逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
@@ -12,15 +12,21 @@
 
 ## 快速开始
 
+管理 API 和控制台监听 `3050` 端口，私有推理接口监听 `3051` 端口。先分别创建 32 字节十六进制主密钥和至少 12 字符的管理员密码文件，不要把密钥文件提交到 Git。`CC_ORIGIN` 必须与浏览器访问管理页时的 origin 完全一致。
+
 ```bash
-npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:3050）
-npm run dev      # watch 模式（文件修改自动重启）
+mkdir -p secrets
+openssl rand -hex 32 > secrets/master-key
+openssl rand -base64 24 > secrets/admin-password
+CC_ORIGIN=https://console.example.com docker compose up -d --build
 ```
+
+通过反向代理访问 `https://console.example.com/command/`。初始登录邮箱默认为 `admin@example.com`，可通过 `CC_ADMIN_EMAIL` 设置。`CC_INTERNAL_BASE_URL` 决定控制台展示和复制的推理地址，应设置为客户端可以访问的地址。所需参数见[管理控制台部署](#管理控制台部署)。
 
 API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
 
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
+curl http://127.0.0.1:3051/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
@@ -33,8 +39,11 @@ commandcode/
 ├── config.json           # 端口 / 日志路径等
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
-├── Dockerfile            # 容器构建文件（node:22-alpine）
+├── protocols.mjs         # Command Code 协议转换
+├── server.mjs            # 管理与推理监听入口
+├── lib/                  # 认证、存储、账单、调度和代理路由
+├── frontend/             # Vue 管理控制台
+├── Dockerfile            # 容器构建文件（node:24-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
 ├── .github/
@@ -48,6 +57,8 @@ commandcode/
 ## 配置
 
 ### config.json
+
+下表保留独立代理原有的协议参数说明。在一体化服务中，管理与推理监听端口由 `PORT` 和 `INFERENCE_PORT` 控制；旧 `config.json` 的 `port`/`host` 字段不决定这两个监听端口。
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
@@ -74,7 +85,7 @@ commandcode/
 | `PORT` | `3000`（自带 config.json 为 `3050`）| 监听端口 → `port` |
 | `HOST` | `0.0.0.0` | 监听地址 → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
-| `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | 空 | 未设置账号专属代理时的全局上游代理，见下文「上游代理」→ `upstreamProxy` |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | 空 | 日志文件 → `logFile`（**同步写**，见[其它注意事项](#其它注意事项)）|
 | `CC_USE_PROVIDER_MODELS` | `true` | 动态拉取模型列表 → `useProviderModels` |
@@ -101,7 +112,11 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
-让代理**发往 Command Code 的请求**走本地 HTTP 代理 —— 用于出口地区调整，或排查风控 `403` 时做 IP 维度对照。
+在控制台「上游账号」的新增或编辑窗口，可为每个账号填写一条专属代理链接，支持 `http://`、`https://` 和 `socks5://`，可带 `user:pass@`。留空则沿用全局设置；编辑时留空表示保持原值，也可勾选移除。代理链接加密保存，管理接口仅返回不含账号密码的地址。
+
+账号列表的「检测代理出口」会像 Sub2API 的 IP 管理一样，经该账号的代理请求固定的 IP 查询站点，并显示真实出口 IP、地区和延迟；IP 查询失败时会尝试只返回 IP 的备用站点。检测结果随账号保存，换代理后清除。出口检测仅证明请求经过代理，模型是否允许该地区仍需在「账号测试」中验证。
+
+以下全局设置作为未配置账号专属代理时的回退：
 
 ```json
 { "upstreamProxy": "http://127.0.0.1:7890" }
@@ -111,12 +126,12 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- 作用于 `/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events` 与 `/provider/v1/models`。
+- 作用于生成、指纹与 lifecycle 预请求、模型目录及额度查询。
 - **不影响**本地监听、`/health` 与 npm 版本检查。
-- 仅支持 `http://`（CONNECT）代理。实现方式是自建 CONNECT 隧道 + `node:https` 复用同一 socket，**不新增任何依赖**，Node 18+ 即可用。
+- HTTP/HTTPS 代理使用 CONNECT 隧道；SOCKS5 使用带可选账号密码的握手，**不新增任何依赖**。
 - 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按**目标主机名**校验，绝不针对代理降级。
 - **指纹/lifecycle 预请求也走代理**是刻意的：若它们直连而上游生成走代理，同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
-- 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
+- 代理地址里带账号密码时，日志只保留协议、主机和端口，**不打印口令**。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
 
@@ -294,7 +309,7 @@ OpenAI **Responses API**（Codex、以及新版 OpenAI SDK 用的那套）。
 - 与 `/v1/chat/completions` 共用同一套上游调用、缓存断点与空闲看门狗。
 
 ```bash
-curl http://127.0.0.1:3050/v1/responses \
+curl http://127.0.0.1:3051/v1/responses \
   -H "Authorization: Bearer user_xxxxxxxxx" -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
 ```
@@ -362,7 +377,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="user_xxxxxxxxx",
-    base_url="http://127.0.0.1:3050/v1",
+    base_url="http://127.0.0.1:3051/v1",
 )
 
 response = client.chat.completions.create(
@@ -376,7 +391,7 @@ for chunk in response:
 
 ### cURL
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
+curl http://127.0.0.1:3051/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
@@ -388,7 +403,7 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ### Cursor
 在 Cursor 设置中添加 Custom Provider：
-- **API Base URL**: `http://127.0.0.1:3050/v1`
+- **API Base URL**: `http://127.0.0.1:3051/v1`
 - **API Key**: `user_xxxxxxxxx`
 - **Model**: 从模型列表中选择
 
@@ -415,7 +430,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 ```json
 {
   "provider": "openai-compatible",
-  "baseUrl": "http://127.0.0.1:3050/v1",
+  "baseUrl": "http://127.0.0.1:3051/v1",
   "apiKey": "user_xxxxxxxxx"
 }
 ```
@@ -496,7 +511,24 @@ CLI 发送图片的格式：
 
 ## Docker 部署
 
+### 管理控制台部署
+
+Compose 文件同时构建此前端和后端。默认把管理与推理端口绑定在宿主机回环地址；仅通过可信反向代理暴露管理路径。主密钥和初始密码从 `CC_SECRETS_DIR`（默认 `./secrets`）挂载。未经加密凭据迁移，不要更换主密钥。
+
+| 变量 | 默认值 | 用途 |
+|------|--------|------|
+| `CC_ORIGIN` | 必填 | 管理页面的公开 origin，用于 CSRF 与 Cookie 校验 |
+| `CC_ADMIN_EMAIL` | `admin@example.com` | 初始管理员邮箱；已有数据库记录不会改变 |
+| `CC_INTERNAL_BASE_URL` | `http://127.0.0.1:3051/v1` | 控制台展示给客户端的推理地址 |
+| `MANAGEMENT_PORT` / `INFERENCE_PORT` | `3050` / `3051` | 宿主机回环端口 |
+| `CC_SECRETS_DIR` | `./secrets` | `master-key` 与 `admin-password` 所在目录 |
+| `CC_DATA_VOLUME` | `commandcode-proxy-data` | SQLite 持久卷名称 |
+
+镜像使用 Node.js 24，Dockerfile 在构建时生成前端资源。管理 API 位于 `/command/api/`；私有推理监听器提供 `/v1/chat/completions`、`/v1/responses` 和 `/v1/messages`。首次启动创建管理员记录，后续使用数据库中的记录。
+
 ### 从 GHCR 拉取
+
+以下标签描述上游项目已发布的 release 镜像。在此贡献合入并发布前，请使用上面的 Compose 命令本地构建。
 
 GitHub Actions 会把多架构镜像（`linux/amd64` + `linux/arm64`）推到 GitHub Container Registry：
 
@@ -514,21 +546,12 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/comman
 
 ### 快速启动 (docker compose)
 
-```bash
-docker compose up -d
-```
-
-代理将在 `http://0.0.0.0:3050` 监听。通过 `PROXY_PORT` 自定义主机端口：
-
-```bash
-PROXY_PORT=13050 docker compose up -d
-```
+创建密钥文件后，执行[快速开始](#快速开始)中的命令。Compose 要求设置 `CC_ORIGIN`。
 
 ### 从源码构建
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
 ```
 
 ### 多架构构建
@@ -539,16 +562,11 @@ npm run docker:build:multi
 
 ### 环境变量
 
-容器相关的只有两个，其余全部见上面的[环境变量](#环境变量)总表：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PORT` | `3050` | 容器内监听端口 |
-| `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
+容器设置见[管理控制台部署](#管理控制台部署)。一体化服务的 `PORT` 默认管理端口 `3050`，`INFERENCE_PORT` 默认推理端口 `3051`，`CC_MAX_INFLIGHT` 默认 `4`。
 
 ## 在途请求上限（可选）
 
-**默认关闭**（`CC_MAX_INFLIGHT` 未设置 = 不限制并发），既有行为不变。
+一体化服务默认最多同时处理 4 个推理请求（`CC_MAX_INFLIGHT=4`）；上游独立协议代理在未设置此变量时默认不限制并发。
 
 本项目定位是**纯反代层**，并发控制属于下游 —— 按 IP / 按 key 的限流请用反向代理（见[内存与部署](#内存与部署)里的 `limit_conn`）。
 本项**不是**那套方案的替代品，只为「不挂反代裸跑」（Dockerfile 与 `npm start` 都支持这种用法）提供一个**进程内、仅全局**的兜底：

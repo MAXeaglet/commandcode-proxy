@@ -2,7 +2,7 @@
 
 > [中文文档](README_zh.md)
 
-A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
+A Command Code gateway with a Vue management console and OpenAI / Anthropic compatible inference endpoints. The gateway uses Node.js built-in modules; the frontend has build-time dependencies.
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
@@ -12,15 +12,21 @@ Built by analyzing official CLI network traffic to accurately replicate the Comm
 
 ## Quick Start
 
+The management API and console listen on port `3050`; private inference listens on port `3051`. Create a 32-byte hex master key and an administrator password of at least 12 characters in separate secret files. Keep both files outside Git. Set `CC_ORIGIN` to the exact browser origin used for management login.
+
 ```bash
-npm start        # Start (the repo ships with config.json listening on http://0.0.0.0:3050)
-npm run dev      # Watch mode (auto-reload on file changes)
+mkdir -p secrets
+openssl rand -hex 32 > secrets/master-key
+openssl rand -base64 24 > secrets/admin-password
+CC_ORIGIN=https://console.example.com docker compose up -d --build
 ```
+
+Open `https://console.example.com/command/` through your reverse proxy. The initial login is `admin@example.com` unless `CC_ADMIN_EMAIL` is set. `CC_INTERNAL_BASE_URL` controls the inference URL displayed and copied by the console; set it to an address reachable by your clients. See [Management deployment](#management-deployment) for the required settings.
 
 API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
 
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
+curl http://127.0.0.1:3051/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
@@ -33,8 +39,11 @@ commandcode/
 ├── config.json           # Port / log path etc.
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Single-file proxy core (~1900 lines)
-├── Dockerfile            # Container build (node:22-alpine)
+├── protocols.mjs         # Command Code protocol conversion
+├── server.mjs            # Management and inference listeners
+├── lib/                  # Authentication, storage, billing, scheduling, proxy routing
+├── frontend/             # Vue management console
+├── Dockerfile            # Container build (node:24-alpine)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
 ├── .github/
@@ -48,6 +57,8 @@ commandcode/
 ## Configuration
 
 ### config.json
+
+The following table documents protocol options inherited from the standalone proxy. In the integrated server, `PORT` and `INFERENCE_PORT` control the management and inference listeners; the legacy `config.json` `port`/`host` values do not select those listeners.
 
 | Field | Default | Description |
 |------|--------|-------------|
@@ -74,7 +85,7 @@ commandcode/
 | `PORT` | `3000` (shipped config.json uses `3050`) | Listen port → `port` |
 | `HOST` | `0.0.0.0` | Listen address → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
-| `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Upstream proxy" below → `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | *(unset)* | Global fallback for accounts without a dedicated upstream proxy; see "Upstream proxy" below → `upstreamProxy` |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
 | `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
@@ -103,7 +114,11 @@ authority for actual retention and provider availability.
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 
-Route the requests the proxy makes **to Command Code** through a local HTTP proxy — for egress-region switching, or for comparing IPs when debugging risk-control `403`s.
+In the console's upstream account editor, assign one proxy URL per account. `http://`, `https://`, and `socks5://` are supported, with optional `user:pass@` authentication. A blank value on edit keeps the existing proxy; the remove checkbox clears it. URLs are encrypted at rest, and management responses expose only the scheme, host and port.
+
+The account list's exit-IP check follows Sub2API's proxy probe: it requests fixed IP services through that account's proxy and displays the observed exit IP, region and latency. Results are saved with the account and cleared when its proxy changes. This confirms the network route; use the account generation test to verify that a model accepts the exit region.
+
+The global setting below is used only for accounts without a dedicated proxy:
 
 ```json
 { "upstreamProxy": "http://127.0.0.1:7890" }
@@ -113,12 +128,12 @@ Route the requests the proxy makes **to Command Code** through a local HTTP prox
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- Applies to `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events` and `/provider/v1/models`.
+- Applies to generation, fingerprint/lifecycle pre-requests, model catalogs and billing queries.
 - **Does not** touch the local listener, `/health`, or the npm version check.
-- Only `http://` (CONNECT) proxies are supported. Implemented with a plain CONNECT tunnel plus `node:https` reusing the same socket, so there is **no new dependency** and it works on Node 18+.
+- HTTP/HTTPS proxies use CONNECT tunnels; SOCKS5 uses an optional username/password handshake. No new dependency is required.
 - Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against the **target hostname**, never against the proxy.
 - Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
-- Credentials in the proxy URL (`http://user:pass@host:port`) are never logged: only `host:port` shows up.
+- Credentials in the proxy URL are never logged: only the scheme, host and port show up.
 
 > Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 
@@ -296,7 +311,7 @@ The request side is translated: `input` (message array; items may omit `type`), 
 - Shares the same upstream call path, cache breakpoints and idle watchdog as `/v1/chat/completions`.
 
 ```bash
-curl http://127.0.0.1:3050/v1/responses \
+curl http://127.0.0.1:3051/v1/responses \
   -H "Authorization: Bearer user_xxxxxxxxx" -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
 ```
@@ -364,7 +379,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="user_xxxxxxxxx",
-    base_url="http://127.0.0.1:3050/v1",
+    base_url="http://127.0.0.1:3051/v1",
 )
 
 response = client.chat.completions.create(
@@ -378,7 +393,7 @@ for chunk in response:
 
 ### cURL
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
+curl http://127.0.0.1:3051/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
@@ -390,7 +405,7 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ### Cursor
 Add a Custom Provider in Cursor settings:
-- **API Base URL**: `http://127.0.0.1:3050/v1`
+- **API Base URL**: `http://127.0.0.1:3051/v1`
 - **API Key**: `user_xxxxxxxxx`
 - **Model**: Choose from the model list
 
@@ -417,7 +432,7 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 ```json
 {
   "provider": "openai-compatible",
-  "baseUrl": "http://127.0.0.1:3050/v1",
+  "baseUrl": "http://127.0.0.1:3051/v1",
   "apiKey": "user_xxxxxxxxx"
 }
 ```
@@ -498,7 +513,24 @@ The proxy receives OpenAI `image_url` format and converts it to the above CC for
 
 ## Docker Deployment
 
+### Management deployment
+
+The compose file builds this PR's frontend and backend together. It binds management and inference to host loopback ports by default; expose only the management route through a trusted reverse proxy. The master key and initial password are mounted from `CC_SECRETS_DIR` (default `./secrets`). Do not rotate the master key without migrating encrypted account credentials.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CC_ORIGIN` | required | Public management origin used for CSRF and cookies |
+| `CC_ADMIN_EMAIL` | `admin@example.com` | Initial administrator email; existing database records are unchanged |
+| `CC_INTERNAL_BASE_URL` | `http://127.0.0.1:3051/v1` | Inference URL shown to clients in the console |
+| `MANAGEMENT_PORT` / `INFERENCE_PORT` | `3050` / `3051` | Host loopback port bindings |
+| `CC_SECRETS_DIR` | `./secrets` | Directory containing `master-key` and `admin-password` |
+| `CC_DATA_VOLUME` | `commandcode-proxy-data` | Persistent SQLite volume name |
+
+The image is built with Node.js 24. The frontend assets are built inside the Dockerfile. The management API is under `/command/api/`, and inference supports `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` on the private listener. The first run creates an administrator record; subsequent runs use the database record.
+
 ### Pull from GHCR
+
+The tags below describe the upstream project's published release image. Build this contribution locally with the compose command above until it is included in a release.
 
 GitHub Actions publishes multi-arch images (`linux/amd64` + `linux/arm64`) to the GitHub Container Registry:
 
@@ -516,21 +548,12 @@ The image is public — no login required to pull. After upgrading, confirm the 
 
 ### Quick Start (docker compose)
 
-```bash
-docker compose up -d
-```
-
-The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize the host port:
-
-```bash
-PROXY_PORT=13050 docker compose up -d
-```
+Use the [Quick Start](#quick-start) command after creating the secret files. `CC_ORIGIN` is required by the compose file.
 
 ### Build from Source
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
 ```
 
 ### Multi-Architecture Build
@@ -541,16 +564,11 @@ npm run docker:build:multi
 
 ### Environment Variables
 
-Only two are container-specific; everything else lives in the [Environment Variables](#environment-variables) table above:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3050` | Container listen port |
-| `PROXY_PORT` | `3050` | Host port (compose only) |
+Use the [Management deployment](#management-deployment) table for container settings. `PORT` defaults to `3050` for management, `INFERENCE_PORT` to `3051` for inference, and `CC_MAX_INFLIGHT` to `4` in this integrated server.
 
 ## In-flight Cap (Optional)
 
-**Off by default** (`CC_MAX_INFLIGHT` unset = no concurrency limit), so existing behaviour is unchanged.
+The integrated server defaults to 4 concurrent inference requests (`CC_MAX_INFLIGHT=4`). The protocol-only runner inherited from upstream defaults to unlimited when this variable is unset.
 
 This project is a **pure proxy layer**; concurrency control belongs downstream — use your reverse proxy for per-IP / per-key limits (see the `limit_conn` block in [Memory & Deployment](#memory--deployment)). This option is **not** a replacement for that; it only covers running **without** a reverse proxy (which both the Dockerfile and `npm start` invite) with an in-process, **global-only** guard:
 

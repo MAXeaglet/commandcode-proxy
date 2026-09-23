@@ -1,4 +1,8 @@
 node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+secrets/
+*.sqlite*
 *.log
 *.zip
 .omo/

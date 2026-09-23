@@ -1,16 +1,41 @@
-version: "3.9"
-
 services:
   proxy:
     build: .
-    ports:
-      - "${PROXY_PORT:-3050}:3050"
-    environment:
-      PORT: "3050"
+    image: local/commandcode-proxy:console
+    user: "0:0"
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MANAGEMENT_PORT:-3050}:3050"
+      - "127.0.0.1:${INFERENCE_PORT:-3051}:3051"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3050"
+      INFERENCE_PORT: "3051"
+      CC_DATABASE: "/data/commandcode.sqlite"
+      CC_MASTER_KEY_FILE: "/run/secrets/master-key"
+      CC_ADMIN_PASSWORD_FILE: "/run/secrets/admin-password"
+      CC_ORIGIN: "${CC_ORIGIN:?Set the public management origin}"
+      CC_ADMIN_EMAIL: "${CC_ADMIN_EMAIL:-admin@example.com}"
+      CC_INTERNAL_BASE_URL: "${CC_INTERNAL_BASE_URL:-http://127.0.0.1:3051/v1}"
+      CC_API_BASE: "https://api.commandcode.ai"
+      CC_MAX_BODY_MB: "8"
+      CC_MAX_INFLIGHT: "4"
+    volumes:
+      - commandcode-data:/data
+      - ${CC_SECRETS_DIR:-./secrets}/master-key:/run/secrets/master-key:ro
+      - ${CC_SECRETS_DIR:-./secrets}/admin-password:/run/secrets/admin-password:ro
+    mem_limit: 768m
     healthcheck:
-      test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3050/health"]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 8s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  commandcode-data:
+    name: ${CC_DATA_VOLUME:-commandcode-proxy-data}

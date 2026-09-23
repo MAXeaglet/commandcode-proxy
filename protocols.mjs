@@ -2,15 +2,16 @@
  * Command Code → OpenAI 兼容代理
  * 基于真实 CLI 流量抓包数据构建
  */
-import http from 'http';
-import https from 'https';
-import tls from 'tls';
-import { Readable } from 'stream';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { parseProxyUrl, proxyFetch, proxyLabel } from './lib/proxy.mjs';
+
+const requestContext = new AsyncLocalStorage();
+export const runProtocol = (context, fn) => requestContext.run(context, fn);
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -28,8 +29,8 @@ function loadConfig() {
     zdr: false,
     cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
     cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
-    fingerprintSalt: '',
-    deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
+    fingerprintSalt: '', // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
+    deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
   };
@@ -218,8 +219,13 @@ async function checkProtocolDrift() {
     log('warn', 'CC version check failed', { error: e.message });
   }
 }
-checkProtocolDrift(); // 启动时立即检查
-setInterval(checkProtocolDrift, CC_VERSION_REFRESH_MS);
+
+export function startProtocolMaintenance() {
+  checkProtocolDrift();
+  const timer = setInterval(checkProtocolDrift, CC_VERSION_REFRESH_MS);
+  timer.unref();
+  return () => clearInterval(timer);
+}
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
 // ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
@@ -249,21 +255,6 @@ const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
 // 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
 // 默认 0 = 禁用，保持既有行为不变：僵死客户端与「卡在工具执行的合法客户端」在协议层无法
 // 区分，而官方 CLI 对上游没有任何 idle timeout（issue #19），贸然加超时会误杀健康请求。
-// 在途请求上限（可选，默认关闭）。项目定位是纯反代层，并发控制属于下游（nginx
-// limit_conn，per-IP / per-key）；本项仅为「不挂反代裸跑」的场景提供一个可选的
-// 进程内全局兜底，不替代下游方案，也不感知客户端身份。
-// 内存 = 在途数 × (0.13MB + 5.5 × body_MB)：body 上限只管住单请求量级，乘数由本项封顶。
-// 超限返回 503 + Retry-After（SDK 会自行退避重试），而不是放任进程被 OOM 杀掉。
-// 默认 0 = 关闭，不限制并发（既有的反代层定位不变，行为零变化）；需要时按需开启：
-//   CC_MAX_INFLIGHT=32 npm start
-// 注意：body 上限只管住单请求量级，乘数由本项封顶。默认 body 上限 100MB 时，
-// N × 最坏 550MB —— 要硬性内存上界需同时下调 CC_MAX_BODY_MB。
-const MAX_INFLIGHT = (() => {
-  const n = Number.parseInt(process.env.CC_MAX_INFLIGHT ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;            // 默认 0 = 不限
-})();
-
-let inflightCount = 0;   // 当前在途请求数（不含 /health）
 
 const CLIENT_DRAIN_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_CLIENT_DRAIN_TIMEOUT_MS ?? '', 10);
@@ -276,11 +267,17 @@ const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 
 // ── 日志 ─────────────────────────────────────────────
 function log(level, msg, data) {
-  const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
-  console.log(line);
-  if (CFG.logFile) {
-    try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
+  const context = requestContext.getStore();
+  if (context && (level === 'error' || /idle timeout/i.test(msg)) && !(context.status >= 400)) context.status = 502;
+  const allowText = new Set(['body', 'code', 'type', 'implemented', 'latest', 'version', 'error', 'message']);
+  const metrics = {};
+  for (const [key, value] of Object.entries(data || {})) {
+    if (typeof value === 'number' || typeof value === 'boolean') metrics[key] = value;
+    else if (typeof value === 'string' && allowText.has(key)) metrics[key] = value.replace(/user_[a-zA-Z0-9_-]+/g, 'user_[redacted]');
   }
+  const line = `[${new Date().toISOString()}] [${level}] ${msg} ${JSON.stringify(metrics)}`;
+  console.log(line);
+  if (CFG.logFile) { try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {} }
 }
 
 // 把上游错误体摘要成单行，便于日志排查。
@@ -288,7 +285,7 @@ function log(level, msg, data) {
 // 截断到 500 字符，避免异常大的 body 刷爆日志；同时压掉换行，保证一条日志一行。
 function summarizeUpstreamError(text, limit = 500) {
   if (!text) return '';
-  const flat = String(text).replace(/\s+/g, ' ').trim();
+  const flat = String(text).replace(/\s+/g, ' ').trim().replace(/user_[a-zA-Z0-9_-]+/g, 'user_[redacted]');
   return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
@@ -328,7 +325,7 @@ setInterval(() => {
     }
   }
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000); // 每小时
+}, 60 * 60 * 1000).unref();
 
 function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
@@ -370,6 +367,9 @@ const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
 
 async function ensureInitialized(apiKey, signal) {
+  const context = requestContext.getStore();
+  const apiBase = context?.apiBase || CFG.apiBase;
+  signal = AbortSignal.any([signal, context?.signal, AbortSignal.timeout(10000)].filter(Boolean));
   const state = getOrCreateKeyState(apiKey);
   const now = Date.now();
   if (now < state.nextInitAt) return;
@@ -386,7 +386,7 @@ async function ensureInitialized(apiKey, signal) {
     const fingerprint = state.fingerprint || {};
 
     await Promise.all([
-      upstreamFetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+      upstreamFetch(`${apiBase}/alpha/fingerprint/record`, {
         method: 'POST', headers, signal,
         body: JSON.stringify(fingerprint),
       }).then(r => {
@@ -396,7 +396,7 @@ async function ensureInitialized(apiKey, signal) {
         if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
       }),
 
-      upstreamFetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+      upstreamFetch(`${apiBase}/alpha/lifecycle-events`, {
         method: 'POST', headers, signal,
         body: JSON.stringify({
           eventType: 'cli_session_exists',
@@ -425,44 +425,6 @@ async function ensureInitialized(apiKey, signal) {
 }
 
 // ── 模型列表 ───────────────────────────────────────
-const MODELS = [
-  // Anthropic
-  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-  { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-  { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
-  // OpenAI
-  { id: 'gpt-5.5', name: 'GPT-5.5' },
-  { id: 'gpt-5.4', name: 'GPT-5.4' },
-  { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
-  { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' },
-  // DeepSeek
-  { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-  { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  // Kimi
-  { id: 'moonshotai/Kimi-K2.6', name: 'Kimi K2.6' },
-  { id: 'moonshotai/Kimi-K2.5', name: 'Kimi K2.5' },
-  // GLM
-  { id: 'zai-org/GLM-5.1', name: 'GLM 5.1' },
-  { id: 'zai-org/GLM-5', name: 'GLM 5' },
-  // MiniMax
-  { id: 'MiniMaxAI/MiniMax-M3', name: 'MiniMax M3' },
-  { id: 'MiniMaxAI/MiniMax-M2.7', name: 'MiniMax M2.7' },
-  { id: 'MiniMaxAI/MiniMax-M2.5', name: 'MiniMax M2.5' },
-  // Qwen
-  { id: 'Qwen/Qwen3.6-Max-Preview', name: 'Qwen 3.6 Max Preview' },
-  { id: 'Qwen/Qwen3.6-Plus', name: 'Qwen 3.6 Plus' },
-  { id: 'Qwen/Qwen3.7-Max', name: 'Qwen 3.7 Max' },
-  // Step
-  { id: 'stepfun/Step-3.7-Flash', name: 'Step 3.7 Flash' },
-  { id: 'stepfun/Step-3.5-Flash', name: 'Step 3.5 Flash' },
-  // Xiaomi
-  { id: 'xiaomi/mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
-  { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
-  // Gemini
-  { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
-  { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
-];
 
 // ── 工具函数 ───────────────────────────────────────
 
@@ -956,23 +918,19 @@ const CC_STATUS_MAP = {
 
 function mapCcError(ccStatus, ccBody) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
-  let message = `CC API error (${ccStatus})`;
+  const context = requestContext.getStore();
+  if (context) context.status = ccStatus;
   let code = null;
-
   if (ccBody) {
     try {
       const parsed = JSON.parse(ccBody);
-      message = parsed.error?.message || parsed.message || message;
       // 上游错误体：{"success":false,"error":{"code":"BAD_REQUEST"|"USAGE_EXCEEDED",...}}
-      // code 是上游的机器可读错误分类（BAD_REQUEST / USAGE_EXCEEDED 等），透出来便于下游 SDK 与运维判定
+      // 只透出机器可读 code；原始 message 可能含凭证，响应体仍用泛化文案。
       code = parsed.error?.code || parsed.code || null;
-    } catch {
-      message = ccBody.slice(0, 200) || message;
-    }
+    } catch {}
   }
-
-  // CC 429 响应可能带 retry-after
-  if (ccStatus === 429) {
+  const message = `Upstream request failed (HTTP ${ccStatus})`;
+  if (mapped.status === 429) {
     return {
       status: 429,
       code,
@@ -982,12 +940,11 @@ function mapCcError(ccStatus, ccBody) {
       },
     };
   }
-
   return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 function mapCcEventError(event) {
-  const message = event.error?.message || event.message || 'Unknown CC error';
+  const message = event.error?.message || event.message || '';
   const code = event.error?.code || event.code || null;
   // 上游 error 事件除了 message 还可能自带 statusCode / isRetryable ——
   // CLI 的 readStreamErrorEvent 读的正是这两个字段，取值链是
@@ -1020,6 +977,7 @@ function mapCcEventError(event) {
 // ── HTTP 请求处理 ──────────────────────────────────
 
 function readBody(req) {
+  if (req.parsedBody) return Promise.resolve(req.parsedBody);
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
@@ -1126,153 +1084,33 @@ function getApiKey(headers) {
   return null;
 }
 
-// ── 上游 HTTP(S) 代理（issue #18）────────────────────
-// 仅作用于发往 CC 上游的请求（/alpha/generate、/provider/v1/models）。
+// ── 上游代理 ─────────────────────────────────────
+// 账号专属代理优先；未设置时使用全局回退。只作用于发往 CC 上游的请求。
 // 本地监听、/health 与 npm registry 版本检查都不经过代理。
-//
-// 零依赖实现：自己建立 CONNECT 隧道，再用 node:https 复用同一个 socket，
-// 因此不需要 undici / https-proxy-agent，engines >=18 也能用。
 // 注意 Node 原生 fetch 不读 HTTPS_PROXY/HTTP_PROXY；官方的环境变量方案需要
 // Node >= 22.21 / 24.5 并设 NODE_USE_ENV_PROXY=1（README 有说明）。
 const UPSTREAM_PROXY = CFG.upstreamProxy || '';
-const PROXY_CONNECT_TIMEOUT_MS = 15000;
-
-// 代理 URL 可能带 user:pass —— 任何日志/错误消息都只允许出现 host:port。
-// （README 承诺「隐私保护日志」，把口令打进启动横幅是直接违反。）
-function redactProxyUrl(raw) {
-  if (!raw) return '(direct)';
-  try {
-    const u = new URL(raw);
-    return `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`;
-  } catch {
-    return '(invalid upstreamProxy)';
-  }
-}
-
-function parseProxyUrl(raw) {
-  let u;
-  try {
-    u = new URL(raw);
-  } catch {
-    // 不回显原串：里面可能就是口令
-    throw new Error('upstreamProxy is not a valid URL (expected http://host:port)');
-  }
-  if (u.protocol !== 'http:') {
-    throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
-  }
-  const auth = u.username
-    ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
-    : null;
-  return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
-}
-
-// 启动即校验：写错的代理地址应当立刻拒绝启动，而不是每个请求各 502 一次。
+const redactProxyUrl = proxyLabel;
 if (UPSTREAM_PROXY) {
-  try {
-    parseProxyUrl(UPSTREAM_PROXY);
-  } catch (e) {
-    log('error', 'Invalid upstreamProxy, refusing to start', {
-      error: e.message, value: redactProxyUrl(UPSTREAM_PROXY),
-    });
+  try { parseProxyUrl(UPSTREAM_PROXY); }
+  catch (error) {
+    log('error', 'Invalid upstreamProxy, refusing to start', { error: error.message, value: proxyLabel(UPSTREAM_PROXY) });
     process.exit(1);
   }
-  log('info', 'Upstream requests will go through the configured proxy', {
-    proxy: redactProxyUrl(UPSTREAM_PROXY),
-  });
+  log('info', 'Upstream requests will go through the configured proxy', { proxy: proxyLabel(UPSTREAM_PROXY) });
 }
 
-/** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
-function headersToInit(raw) {
-  const out = [];
-  for (const [k, v] of Object.entries(raw)) {
-    if (Array.isArray(v)) { for (const item of v) out.push([k, String(item)]); }
-    else if (v !== undefined) out.push([k, String(v)]);
-  }
-  return out;
+/** Per-account proxy takes precedence over the global fallback. */
+function upstreamFetch(urlStr, options, accountProxy) {
+  const selected = accountProxy ?? requestContext.getStore()?.proxyUrl ?? UPSTREAM_PROXY;
+  return selected ? proxyFetch(urlStr, options, selected) : fetch(urlStr, options);
 }
 
-/** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
-async function proxyFetch(urlStr, options = {}) {
-  const proxy = parseProxyUrl(UPSTREAM_PROXY);
-  const u = new URL(urlStr);
-  const isTls = u.protocol === 'https:';
-  const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
-  const target = `${u.hostname}:${port}`;
-  const { signal, body } = options;
-  const onAbort = (fn) => { if (signal) signal.addEventListener('abort', fn, { once: true }); };
-
-  // 1. CONNECT 隧道 —— 代理只做裸字节转发，TLS 由本端端到端完成
-  const rawSocket = await new Promise((resolve, reject) => {
-    const connectReq = http.request({
-      host: proxy.host,
-      port: proxy.port,
-      method: 'CONNECT',
-      path: target,
-      headers: { Host: target, ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
-      timeout: PROXY_CONNECT_TIMEOUT_MS,
-    });
-    connectReq.on('connect', (res, socket) => {
-      if (res.statusCode !== 200) {
-        socket.destroy();
-        reject(new Error(`upstream proxy CONNECT ${target} failed: HTTP ${res.statusCode}`));
-        return;
-      }
-      resolve(socket);
-    });
-    connectReq.on('timeout', () => connectReq.destroy(new Error('upstream proxy CONNECT timeout')));
-    connectReq.on('error', reject);
-    onAbort(() => { try { connectReq.destroy(); } catch {} });
-    connectReq.end();
-  });
-
-  // 2. 隧道上做 TLS（证书按目标主机名校验，不做任何降级）
-  let socket = rawSocket;
-  if (isTls) {
-    socket = tls.connect({ socket: rawSocket, servername: u.hostname });
-    await new Promise((resolve, reject) => {
-      socket.once('secureConnect', resolve);
-      socket.once('error', reject);
-      onAbort(() => { try { socket.destroy(); } catch {} });
-    });
-  }
-
-  // 3. 复用隧道 socket 发请求
-  return await new Promise((resolve, reject) => {
-    const mod = isTls ? https : http;
-    const req = mod.request({
-      host: u.hostname,
-      port,
-      path: u.pathname + u.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-      createConnection: () => socket,
-    }, (res) => {
-      // 204/205/304 按规范不允许带 body，Response 构造器会直接抛 —— 这两个状态必须传 null，
-      // 同时把连接排空，避免隧道 socket 悬着。
-      const nullBodyStatus = res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304;
-      if (nullBodyStatus) { try { res.resume(); } catch {} }
-      resolve(new Response(nullBodyStatus ? null : Readable.toWeb(res), {
-        status: res.statusCode,
-        statusText: res.statusMessage,
-        headers: headersToInit(res.headers),
-      }));
-    });
-    req.on('error', reject);
-    onAbort(() => { try { req.destroy(); } catch {} });
-    if (body !== undefined && body !== null) req.write(body);
-    req.end();
-  });
-}
-
-/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
-function upstreamFetch(urlStr, options) {
-  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
-}
+function upstreamProxyLabel() { return proxyLabel(UPSTREAM_PROXY); }
 
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
-  const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
   // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
@@ -1302,12 +1140,19 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     headers['x-cmd-zdr'] = '1';
   }
 
-  const response = await upstreamFetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
+  const context = requestContext.getStore();
+  if (context) context.dispatched = true;
+  let response;
+  try {
+    response = await upstreamFetch(`${context?.apiBase || CFG.apiBase}/alpha/generate`, {
+      method: 'POST', headers, body: JSON.stringify(body),
+      signal: context?.signal ? AbortSignal.any([signal, context.signal].filter(Boolean)) : signal,
+    });
+  } catch {
+    if (context) context.status = 0;
+    throw new Error('Upstream network request failed');
+  }
+  if (context) { context.status = response.status; context.retryAfter = response.headers.get('retry-after'); context.onConnected?.(); }
 
   return response;
 }
@@ -2574,50 +2419,6 @@ async function handleMessages(req, res) {
   }
 }
 
-// ── 动态模型列表 ────────────────────────────────────
-
-let dynamicModels = null;
-let modelsLastFetch = 0;
-
-async function fetchModels(apiKey) {
-  const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
-  }
-
-  try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
-
-    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
-      }
-    }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
-  } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
-  }
-
-  // Fallback to hardcoded MODELS
-  return MODELS;
-}
-
 // ── OpenAI Responses API（/v1/responses）──────────────
 // 供 Codex 等使用 Responses 协议的客户端接入。代理仍是无状态转换层：
 // 把 input 翻译成内部 Chat 格式，复用同一套 CC 转发管线。
@@ -3346,145 +3147,4 @@ async function handleResponses(req, res) {
   }
 }
 
-async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
-  const now = nowUnix();
-  sendJSON(res, 200, {
-    object: 'list',
-    data: models.map(m => ({
-      id: m.id,
-      object: 'model',
-      created: now,
-      owned_by: 'command-code',
-    })),
-  });
-}
-
-function handleHealth(req, res) {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('OK');
-}
-
-// ── 服务器 ──────────────────────────────────────────
-
-const server = http.createServer(async (req, res) => {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
-
-  // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
-  const isLiveness = url.pathname === '/health' || url.pathname === '/';
-  if (!isLiveness && MAX_INFLIGHT > 0) {
-    if (inflightCount >= MAX_INFLIGHT) {
-      log('warn', 'In-flight limit reached, rejecting request', {
-        maxInflight: MAX_INFLIGHT, inflight: inflightCount, path: url.pathname,
-      });
-      sendJSON(res, 503, {
-        error: { message: `Too many concurrent requests (limit ${MAX_INFLIGHT}), retry shortly`, type: 'server_busy' },
-        retry_after: 5,
-      });
-      return;
-    }
-    inflightCount++;
-    // 释放时机：响应写完（finish）或连接终止（close）—— 取先到者，且幂等，
-    // 保证任何退出路径（成功/出错/客户端断连/超时）都不会泄漏槽位。
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      if (inflightCount > 0) inflightCount--;
-    };
-    res.once('finish', release);
-    res.once('close', release);
-  }
-
-  try {
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-      await handleChatCompletions(req, res);
-    } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
-      await handleMessages(req, res);
-    } else if (url.pathname === '/v1/responses' && req.method === 'POST') {
-      await handleResponses(req, res);
-    } else if (url.pathname === '/v1/models' && req.method === 'GET') {
-      await handleModels(req, res);
-    } else if (url.pathname === '/health' || url.pathname === '/') {
-      handleHealth(req, res);
-    } else {
-      sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
-    }
-  } catch (e) {
-    sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
-  }
-});
-
-// 全局兜底：abort 触发的异步 rejection 不会让进程崩溃
-process.on('unhandledRejection', (reason) => {
-  if (reason?.name === 'AbortError' || reason?.code === 'ABORT_ERR') {
-    // 客户端断连触发的 abort — 预期行为，静默处理
-    log('info', 'Aborted request cleaned up');
-  } else {
-    log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
-  }
-});
-
-// ── keep-alive 时序（放在反向代理后面时是必调项） ──────────────
-// 反代（nginx/OpenResty）的 upstream keepalive_timeout 必须**小于**这里的值，
-// 否则反代会复用一条后端已经关掉的连接：它把请求体写过去，后端早已 FIN，
-// 写这一侧就是 EPIPE —— nginx 侧表现为
-//   sendfile() failed (32: Broken pipe) while sending request to upstream
-// 而这条请求是 POST（非幂等），nginx 默认不会重试 → 客户端直接吃 502。
-//
-// Node 默认 keepAliveTimeout=5s。反代若用常见的 4s，余量只有 1 秒；一旦反代的
-// 空闲判定基准与后端差一点（大响应体读完的时刻 vs 后端写完的时刻），就会踩上。
-// 这里显式抬到 65s，让「谁先关」不再取决于一两秒的抖动 —— 与 Node 官方在
-// 反向代理后部署的建议一致（keepAliveTimeout > 前端 idle timeout）。
-// 反代侧仍建议设 keepalive_timeout 60s 以内。
-const KEEPALIVE_TIMEOUT_MS = (() => {
-  const ms = Number.parseInt(process.env.CC_KEEPALIVE_TIMEOUT_MS ?? '', 10);
-  return Number.isFinite(ms) && ms > 0 ? ms : 65000;
-})();
-server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
-server.headersTimeout = KEEPALIVE_TIMEOUT_MS + 1000;   // Node 要求 headersTimeout > keepAliveTimeout
-
-server.listen(CFG.port, CFG.host, () => {
-  log('info', 'CC Proxy started', {
-    url: `http://${CFG.host}:${CFG.port}`,
-    api: CFG.apiBase,
-    models: MODELS.length,
-    session: '12h + 1h jitter, per API key',
-    zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
-    emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
-    logFile: CFG.logFile || '(console only)',
-    clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
-    keepAliveTimeout: `${KEEPALIVE_TIMEOUT_MS}ms (反代侧 keepalive_timeout 必须小于它)`,
-    idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
-    maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
-    upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
-  });
-  if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
-    log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
-  }
-  // 内存提示：body 上限隐含的最坏内存 = 上限 × 实测放大系数（见 MAX_BODY_SIZE 注释 / issue #20）
-  const bodyCapMB = Math.round(MAX_BODY_SIZE / 1048576);
-  const worstCaseMB = Math.round(bodyCapMB * 5.5);
-  if (worstCaseMB >= 500) {
-    log('warn', 'Request body limit implies high per-request worst-case memory', {
-      maxBodyMB: bodyCapMB,
-      worstCaseRSSPerRequestMB: worstCaseMB,
-      hint: 'lower CC_MAX_BODY_MB, set CC_MAX_INFLIGHT, and/or cap in-flight requests at the reverse proxy (see README)',
-    });
-  }
-  if (!CFG.apiKey) {
-    log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
-  }
-});
+export { handleChatCompletions, handleMessages, handleResponses, buildCcRequest, forwardToCC, upstreamFetch, redactProxyUrl, upstreamProxyLabel };
