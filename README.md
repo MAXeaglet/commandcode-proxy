@@ -361,6 +361,8 @@ Upstream CC status mapping (`CC_STATUS_MAP`; anything unlisted becomes `502 upst
 
 The machine-readable classification from the upstream error body (`error.code`, e.g. `BAD_REQUEST` / `USAGE_EXCEEDED`) is passed through as `error.code`.
 
+CC reports failures inside the response stream rather than always using an HTTP status: `{"type":"error","error":{...,"statusCode":N,"isRetryable":B}}`. The proxy takes that status (a leading `<NNN>` in the message wins over it, matching the CLI) and maps it the same way as an HTTP-level error; for example, an upstream-declared 400 / 429 reaches the client with its own status instead of being collapsed into a blanket 502.
+
 ## Model List
 
 The proxy returns a live model list via `GET /v1/models`. Below are common models for reference; the actual list depends on the live API response — see [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits) for plan details.
