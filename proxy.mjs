@@ -2630,6 +2630,8 @@ let dynamicModels = null;
 let modelsLastFetch = 0;
 const planFilterCache = new Map();
 const planFilterInFlight = new Map();
+let pricingRowsCache = null;
+let pricingRowsInFlight = null;
 
 async function fetchModels(apiKey) {
   const now = Date.now();
@@ -2667,7 +2669,7 @@ async function fetchModels(apiKey) {
   return applyPlanFilter(dynamicModels || MODELS, apiKey);
 }
 
-async function fetchPlanFilter(apiKey) {
+async function fetchPlanId(apiKey) {
   const subscription = await upstreamFetch(`${CFG.apiBase}/alpha/billing/subscriptions`, {
     headers: { 'x-api-key': apiKey },
     signal: AbortSignal.timeout(10000),
@@ -2675,14 +2677,42 @@ async function fetchPlanFilter(apiKey) {
   if (!subscription.ok) return null;
   const subscriptionBody = await subscription.json();
   const planId = subscriptionBody?.data?.planId;
-  if (typeof planId !== 'string' || !planId) return null;
+  return typeof planId === 'string' && planId ? planId : null;
+}
 
-  const pricing = await upstreamFetch('https://commandcode.ai/docs/resources/pricing-limits', {
+async function fetchPricingRows() {
+  const now = Date.now();
+  if (pricingRowsCache && pricingRowsCache.expiresAt > now) return pricingRowsCache.data;
+  if (pricingRowsInFlight) return pricingRowsInFlight;
+
+  pricingRowsInFlight = upstreamFetch('https://commandcode.ai/docs/resources/pricing-limits', {
     headers: { rsc: '1' },
     signal: AbortSignal.timeout(10000),
-  });
-  if (!pricing.ok) return null;
-  return { planId, rows: extractPricingRows(await pricing.text()) };
+  })
+    .then(async pricing => {
+      if (!pricing.ok) return null;
+      const rows = extractPricingRows(await pricing.text());
+      if (!rows.length) {
+        log('warn', 'Pricing model rows not recognized, using unfiltered list');
+        return null;
+      }
+      return rows;
+    })
+    .catch(e => {
+      log('warn', 'Pricing model fetch failed, using unfiltered list', { error: e.message });
+      return null;
+    })
+    .then(data => {
+      const expiresAt = Date.now() + CFG.modelRefreshIntervalMs;
+      pricingRowsCache = { data, expiresAt };
+      const timer = setTimeout(() => {
+        if (pricingRowsCache?.expiresAt === expiresAt) pricingRowsCache = null;
+      }, CFG.modelRefreshIntervalMs);
+      timer.unref?.();
+      return data;
+    })
+    .finally(() => { pricingRowsInFlight = null; });
+  return pricingRowsInFlight;
 }
 
 async function applyPlanFilter(models, apiKey) {
@@ -2690,12 +2720,13 @@ async function applyPlanFilter(models, apiKey) {
   const now = Date.now();
   const cached = planFilterCache.get(apiKey);
   if (cached && cached.expiresAt > now) {
-    return cached.data ? filterModelsByPlan(models, cached.data.planId, cached.data.rows) : models;
+    const rows = cached.data && await fetchPricingRows();
+    return cached.data && rows ? filterModelsByPlan(models, cached.data, rows) : models;
   }
 
   let pending = planFilterInFlight.get(apiKey);
   if (!pending) {
-    pending = fetchPlanFilter(apiKey)
+    pending = fetchPlanId(apiKey)
       .catch(e => {
         log('warn', 'Plan model filter failed, using unfiltered list', { error: e.message });
         return null;
@@ -2716,8 +2747,10 @@ async function applyPlanFilter(models, apiKey) {
     planFilterInFlight.set(apiKey, pending);
   }
 
-  const data = await pending;
-  return data ? filterModelsByPlan(models, data.planId, data.rows) : models;
+  const planId = await pending;
+  if (!planId) return models;
+  const rows = await fetchPricingRows();
+  return rows ? filterModelsByPlan(models, planId, rows) : models;
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
