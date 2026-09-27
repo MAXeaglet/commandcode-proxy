@@ -2628,6 +2628,8 @@ function filterModelsByPlan(models, planId, rows) {
 
 let dynamicModels = null;
 let modelsLastFetch = 0;
+const planFilterCache = new Map();
+const planFilterInFlight = new Map();
 
 async function fetchModels(apiKey) {
   const now = Date.now();
@@ -2665,28 +2667,57 @@ async function fetchModels(apiKey) {
   return applyPlanFilter(dynamicModels || MODELS, apiKey);
 }
 
+async function fetchPlanFilter(apiKey) {
+  const subscription = await upstreamFetch(`${CFG.apiBase}/alpha/billing/subscriptions`, {
+    headers: { 'x-api-key': apiKey },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!subscription.ok) return null;
+  const subscriptionBody = await subscription.json();
+  const planId = subscriptionBody?.data?.planId;
+  if (typeof planId !== 'string' || !planId) return null;
+
+  const pricing = await upstreamFetch('https://commandcode.ai/docs/resources/pricing-limits', {
+    headers: { rsc: '1' },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!pricing.ok) return null;
+  return { planId, rows: extractPricingRows(await pricing.text()) };
+}
+
 async function applyPlanFilter(models, apiKey) {
   if (!CFG.useProviderModelsWithPlanFilter || !apiKey) return models;
-  try {
-    const subscription = await upstreamFetch(`${CFG.apiBase}/alpha/billing/subscriptions`, {
-      headers: { 'x-api-key': apiKey },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!subscription.ok) return models;
-    const subscriptionBody = await subscription.json();
-    const planId = subscriptionBody?.data?.planId;
-    if (typeof planId !== 'string' || !planId) return models;
-
-    const pricing = await upstreamFetch('https://commandcode.ai/docs/resources/pricing-limits', {
-      headers: { rsc: '1' },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!pricing.ok) return models;
-    return filterModelsByPlan(models, planId, extractPricingRows(await pricing.text()));
-  } catch (e) {
-    log('warn', 'Plan model filter failed, using unfiltered list', { error: e.message });
-    return models;
+  const now = Date.now();
+  const cached = planFilterCache.get(apiKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.data ? filterModelsByPlan(models, cached.data.planId, cached.data.rows) : models;
   }
+
+  let pending = planFilterInFlight.get(apiKey);
+  if (!pending) {
+    pending = fetchPlanFilter(apiKey)
+      .catch(e => {
+        log('warn', 'Plan model filter failed, using unfiltered list', { error: e.message });
+        return null;
+      })
+      .then(data => {
+        const expiresAt = Date.now() + CFG.modelRefreshIntervalMs;
+        planFilterCache.set(apiKey, {
+          data,
+          expiresAt,
+        });
+        const timer = setTimeout(() => {
+          if (planFilterCache.get(apiKey)?.expiresAt === expiresAt) planFilterCache.delete(apiKey);
+        }, CFG.modelRefreshIntervalMs);
+        timer.unref?.();
+        return data;
+      })
+      .finally(() => planFilterInFlight.delete(apiKey));
+    planFilterInFlight.set(apiKey, pending);
+  }
+
+  const data = await pending;
+  return data ? filterModelsByPlan(models, data.planId, data.rows) : models;
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
