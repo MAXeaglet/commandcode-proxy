@@ -2617,12 +2617,13 @@ function extractPricingRows(rsc) {
 
 function filterModelsByPlan(models, planId, rows) {
   if (!planId) return models;
+  const modelKey = id => String(id).split('/').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
   const availability = new Map(
     rows
       .filter(isPricingRow)
-      .map(row => [row.id, row.availability]),
+      .map(row => [modelKey(row.id), row.availability]),
   );
-  return models.filter(model => availability.get(model.id)?.[planId] !== false);
+  return models.filter(model => availability.get(modelKey(model.id))?.[planId] !== false);
 }
 
 let dynamicModels = null;
