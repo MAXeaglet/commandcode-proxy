@@ -59,6 +59,7 @@ commandcode/
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
+| `useProviderModelsWithPlanFilter` | `false` | Filter models by the subscription plan for the current API key |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
 | `cliMode` | `agent` | Envelope `mode`. Upstream enum: `agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
