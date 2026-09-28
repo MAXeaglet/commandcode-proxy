@@ -2630,6 +2630,62 @@ function responsesTextOf(content) {
   return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
 }
 
+// data URL 图片：一段文本里超过这个长度的 data URL 就当成"图"，提出来单独发；小图留在文本里
+const INLINE_IMAGE_MIN = 256 * 1024;
+// 单张 data URL 上限：再大就不要了，只留一句占位说明（既撑爆上游窗口，也撑爆内存）
+const MAX_TOOL_IMAGE_URL = 12 * 1024 * 1024;
+const DATA_URL_RE = /data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi;
+
+// 从一段文本里捞出体积可观的 data URL 图片，原地替换成 [image] 占位。
+// 必要性：base64 一旦被上游按**文本**分词就极其昂贵 —— 真机实测单张 2.76MB 截图 ≈ 1.92M token。
+function extractInlineImages(text) {
+  const images = [];
+  const stripped = String(text).replace(DATA_URL_RE, (url) => {
+    if (url.length < INLINE_IMAGE_MIN) return url;          // 小图留文本，别把工具输出切碎
+    if (url.length > MAX_TOOL_IMAGE_URL) return '[image omitted: too large]';
+    images.push(url);
+    return '[image]';
+  });
+  return { text: stripped, images };
+}
+
+// Responses 的 function_call_output.output 可能是字符串，也可能是内容块数组；后者能带图。
+// Codex Desktop 的截图工具就是 [{type:'input_image', image_url:'data:image/png;base64,...'}]。
+// 返回 { text, images }，images 为 data URL 字符串数组。
+function splitToolOutput(output) {
+  if (output === undefined || output === null) return { text: '', images: [] };
+  const texts = [];
+  const images = [];
+  const pushText = (raw) => {
+    const r = extractInlineImages(raw);
+    if (r.text) texts.push(r.text);
+    images.push(...r.images);
+  };
+  if (typeof output === 'string') {
+    pushText(output);
+  } else if (Array.isArray(output)) {
+    for (const part of output) {
+      if (!part) continue;
+      if (part.type === 'input_image' || part.type === 'image_url') {
+        const url = typeof part.image_url === 'string' ? part.image_url : (part.image_url && part.image_url.url) || '';
+        if (url.startsWith('data:')) {
+          if (url.length <= MAX_TOOL_IMAGE_URL) images.push(url);
+          else texts.push('[image omitted: too large]');
+        } else if (url) {
+          texts.push(`[image: ${url}]`);      // 外链图上游不认，只能留个说明
+        }
+      } else if (typeof part.text === 'string') {
+        pushText(part.text);
+      } else {
+        pushText(JSON.stringify(part));       // 未知块保持原样，与旧行为一致
+      }
+    }
+  } else {
+    pushText(JSON.stringify(output));
+  }
+  return { text: texts.filter(Boolean).join('\n'), images };
+}
+
 function responsesReasoningOf(item) {
   if (!item) return '';
   if (Array.isArray(item.summary) && item.summary.length) return item.summary.map(p => (p && p.text) || '').join('');
@@ -2703,11 +2759,26 @@ function convertResponsesToChat(respReq) {
         }
         case 'function_call_output': {
           flushPending();
-          messages.push({
-            role: 'tool',
-            tool_call_id: item.call_id || '',
-            content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output === undefined ? '' : item.output),
-          });
+          // 工具结果里可能带图（Codex Desktop 截图工具即 output=[{type:'input_image', image_url:'data:image/png;base64,...'}]）。
+          // 绝不能 JSON.stringify 成文本送上游：base64 会按文本分词，真机实测单张 2.76MB 截图 ≈ 1.92M token，
+          // 直接撞穿模型 1M 窗口（"maximum context length is 1048576 tokens ... 1922800 in the messages"）。
+          // 官方 CLI 的排布是：tool-result 只放文本，图片提出来放进紧跟其后的一条 user 消息
+          // （见 command-code@1.66.0 dist/cli.mjs 的 convertUserMessage / tool_result 分支）。
+          const { text, images } = splitToolOutput(item.output);
+          messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
+          if (images.length) {
+            log('info', 'Hoisted tool-output images to user message', {
+              count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
+            });
+            // content 走 image_url 形态，交给 buildCcRequest 里已验证的 user 图片分支转成 CC 的 {type:'image',image,mimeType}
+            messages.push({
+              role: 'user',
+              content: [
+                { type: 'text', text: '[image returned by tool call]' },
+                ...images.map(url => ({ type: 'image_url', image_url: { url } })),
+              ],
+            });
+          }
           break;
         }
         default: {
