@@ -317,6 +317,7 @@ The request side is translated: `input` (message array; items may omit `type`), 
 - **Stateless**: `previous_response_id` is not supported and answers `400` — send the full `input` every turn (the proxy stores no conversation history).
 - Errors use the Responses shape: `{"error":{"message":...,"type":...}}`.
 - Shares the same upstream call path, cache breakpoints and idle watchdog as `/v1/chat/completions`.
+- **First-token silence and keep-alive**: `response.created` / `response.in_progress` are emitted **immediately** once upstream returns `200`, and a `: keepalive` SSE comment follows every 5 s while waiting. Time-to-first-token for a reasoning model with a large prompt measured 15–40 s; that silent window used to put **zero bytes** on the wire, so intermediate layers (EdgeOne's origin idle timeout measured ~15 s) or client first-byte timeouts cut the connection — visible as nginx `499` with `body_bytes_sent=0` and a client retrying every 15 s. SSE comments must be ignored by clients per spec (`/v1/messages` uses `event: ping`, but Responses has no ping event and an unknown event type risks strict-parser errors).
 
 ```bash
 curl http://127.0.0.1:3050/v1/responses \

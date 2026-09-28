@@ -3031,6 +3031,9 @@ function createResponsesSseTranslator(model, responseId, created) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    // 提前发 created/in_progress（不带内容）：上游是 reasoning 模型，大 prompt 首字可能要十几秒，
+    // 这期间一个字节都不出网就会被中间层（实测 EdgeOne 源站 ~15s）或客户端首字节超时掐掉
+    start: startResponse,
     get started() { return createdSent; },
     get stopReason() { return finishReason; },
     parseLine(line) {
@@ -3249,6 +3252,24 @@ async function handleResponses(req, res) {
         await waitDrain(res);
       };
 
+      // 上游已 200：立刻把响应头 + response.created / response.in_progress 推下去。
+      // 不能等首个内容事件 —— Codex 实测 reasoning_effort=max + 大 prompt，首字要 15s+，
+      // 这段时间此前**零字节出网**，于是 nginx access.log 全是 `499 0`（body_bytes_sent=0）、
+      // 中间 CDN（EdgeOne）按源站超时掐掉连接、客户端只能每 15 秒重试一次。
+      // created 是不带内容的协议首事件，先发符合 Responses 语义；上游随后失败会走 response.failed。
+      await writeEvents(translator.start());
+
+      // SSE 保活：对齐 /v1/messages 的心跳思路，但这里发**注释行**。
+      // Responses 协议没有 ping 事件，塞未知 event 类型有被严格解析器判错的风险；
+      // 注释行（以 ':' 开头）按 SSE 规范必须被忽略 —— chat 端点在静默事件时也是这么发的。
+      // 为什么必须发：首字前的静默期实测 15~40s，中间层的"源站空闲"超时（EdgeOne 实测约 15s）
+      // 会把连接掐掉 —— 现象是客户端 ~16s 断连、代理侧 Client disconnected、nginx 只记到很少字节。
+      const heartbeat = setInterval(() => {
+        // 回调是同步的，无法 await waitDrain，所以用 writableNeedDrain 直接跳过（背压时少一条注释无副作用）
+        if (aborted || !started || res.writableEnded || res.writableNeedDrain) return;
+        try { res.write(': keepalive\n\n'); } catch (e2) {}
+      }, 5000);
+
       try {
         while (true) {
           const result = await Promise.race([reader.read(), idle.arm()]);
@@ -3327,6 +3348,7 @@ async function handleResponses(req, res) {
           }
         }
       } finally {
+        clearInterval(heartbeat);
         idle.dispose();
       }
 

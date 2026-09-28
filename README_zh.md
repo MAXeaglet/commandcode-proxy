@@ -312,6 +312,7 @@ OpenAI **Responses API**（Codex、以及新版 OpenAI SDK 用的那套）。
 - **无状态**：`previous_response_id` 不支持，传了直接 `400` —— 每轮把完整 `input` 发过来即可（代理不存会话历史）。
 - 错误体是 Responses 风格：`{"error":{"message":...,"type":...}}`。
 - 与 `/v1/chat/completions` 共用同一套上游调用、缓存断点与空闲看门狗。
+- **首字静默与保活**：拿到上游 `200` 后**立刻**下发 `response.created` / `response.in_progress`，此后等待期间每 5s 发一条 SSE 注释行 `: keepalive`。reasoning 模型 + 大 prompt 的首字实测 15~40s，这段静默期此前**零字节出网**，会被中间层（实测 EdgeOne 源站空闲超时约 15s）或客户端首字节超时掐断 —— 现象是 nginx 侧 `499`、`body_bytes_sent=0`、客户端每 15 秒重试一次。注释行按 SSE 规范必须被客户端忽略（`/v1/messages` 用的是 `event: ping`，Responses 没有 ping 事件，塞未知 event 类型有被严格解析器判错的风险）。
 
 ```bash
 curl http://127.0.0.1:3050/v1/responses \
