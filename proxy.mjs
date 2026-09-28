@@ -3107,6 +3107,16 @@ function createResponsesSseTranslator(model, responseId, created) {
 
         case 'error': {
           this.upstreamError = mapCcEventError(event);
+          // 上游在 HTTP 200 之后于**流内**报错时，这里以前只赋值不打日志：客户端收到 400，
+          // 而 journalctl 里一片安静（本次排障就是靠 nginx 的 body_bytes_sent=0 反推的）。
+          // 对齐 /v1/chat/completions 路径的 CC stream error。
+          log('warn', 'CC stream error', {
+            path: '/v1/responses',
+            message: event.error?.message || event.message || 'Unknown error',
+            upstreamStatus: this.upstreamError.reportedStatus,
+            code: this.upstreamError.code,
+            mappedTo: this.upstreamError.status,
+          });
           break;
         }
 
