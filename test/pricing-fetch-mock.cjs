@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const originalFetch = globalThis.fetch;
 const PRICING_URL = 'https://commandcode.ai/docs/resources/pricing-limits';
-const PRICING_RSC = 'segment:["x",null,{"rows":[{"id":"gemini-3.8-flash","availability":{"individual-go":false}}]}]';
+const PRICING_RSC = 'segment:["x",null,{"rows":[{"id":"gemini-3.8-flash","availability":{"individual-go":false}},{"id":"claude-haiku-4-5","name":"Claude Haiku 4.5","availability":{"individual-go":false}}]}]';
 
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input?.url;

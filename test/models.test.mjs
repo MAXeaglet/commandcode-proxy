@@ -8,6 +8,7 @@ import { startMockUpstream, startProxy } from './helpers.mjs';
 
 const MODELS = [
   { id: 'google/gemini-3.8-flash' },
+  { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
   { id: 'unknown-model' },
 ];
 const MOCK = join(dirname(fileURLToPath(import.meta.url)), 'pricing-fetch-mock.cjs');

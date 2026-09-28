@@ -2618,12 +2618,12 @@ function extractPricingRows(rsc) {
 function filterModelsByPlan(models, planId, rows) {
   if (!planId) return models;
   const modelKey = id => String(id).split('/').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
-  const availability = new Map(
-    rows
-      .filter(isPricingRow)
-      .map(row => [modelKey(row.id), row.availability]),
-  );
-  return models.filter(model => availability.get(modelKey(model.id))?.[planId] !== false);
+  const keysFor = item => [item.id, item.name].filter(Boolean).map(modelKey);
+  const availability = new Map();
+  for (const row of rows.filter(isPricingRow)) {
+    for (const key of keysFor(row)) availability.set(key, row.availability);
+  }
+  return models.filter(model => !keysFor(model).some(key => availability.get(key)?.[planId] === false));
 }
 
 let dynamicModels = null;
@@ -2653,7 +2653,7 @@ async function fetchModels(apiKey) {
         if (Array.isArray(data.data)) {
           dynamicModels = data.data.map(m => ({
             id: m.id,
-            name: m.id,
+            name: m.name || m.id,
           }));
           modelsLastFetch = now;
           log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
