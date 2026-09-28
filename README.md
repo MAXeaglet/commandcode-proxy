@@ -85,6 +85,7 @@ commandcode/
 | `CC_DEVICE_PROJECT_DIR` | empty | Faked project directory → `deviceProjectDir` |
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt; `false` disables → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests get `413` |
+| `CC_MAX_TOOL_IMAGE_MB` | `6` | Total per-request budget for tool screenshots (base64); older ones become a placeholder; `0` disables. See [Tool screenshot budget](#tool-screenshot-budget) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout |
 | `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
@@ -100,6 +101,28 @@ authority for actual retention and provider availability.
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+### Tool screenshot budget
+
+Images inside tool results are sent upstream as **separate** `image` blocks (an `input_image` inside
+`function_call_output.output` is no longer `JSON.stringify`-ed into the tool-result text). Base64 is extremely
+expensive once upstream tokenizes it as **text** — a single 2.76 MB Codex Desktop screenshot measured
+≈ **1.92M tokens**, blowing straight through a 1M window:
+
+```
+400 This model's maximum context length is 1048576 tokens. However, you requested
+    1986800 tokens (1922800 in the messages, 64000 in the completion)
+```
+
+Images are still **re-sent in full every turn**: one real session carried 11 screenshots ≈5.5 MB of base64,
+which — with the memory amplification above (×5.1–7.4) — pushed the proxy to `anon-rss 532 MB` and triggered a
+**global OOM** on a 1 GB box. `CC_MAX_TOOL_IMAGE_MB` (default `6`) keeps the **newest** images within budget
+(at least one) and replaces the rest with `[older tool screenshot omitted: image budget exceeded]`, so the model
+knows an image was dropped instead of assuming none ever existed. Only tool screenshots are affected; images
+you attach yourself are untouched.
+
+> Raise the budget if the model really needs every screenshot, but size memory as `budget × in-flight × 5–7`
+> (see [in-flight cap](#in-flight-cap-optional)).
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 

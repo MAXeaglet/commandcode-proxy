@@ -85,6 +85,7 @@ commandcode/
 | `CC_DEVICE_PROJECT_DIR` | 空 | 伪装的项目目录 → `deviceProjectDir` |
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位；`false` 关掉 → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
+| `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
@@ -98,6 +99,25 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+### 工具截图预算
+
+工具结果里的图片会**单独**作为 `image` 块发给上游（`function_call_output.output` 里的 `input_image`
+不再被 `JSON.stringify` 进 tool-result 文本）。原因是 base64 一旦被上游按**文本**分词就极其昂贵 ——
+真机实测 Codex Desktop 单张 2.76MB 截图 ≈ **1.92M token**，直接撞穿模型的 1M 窗口：
+
+```
+400 This model's maximum context length is 1048576 tokens. However, you requested
+    1986800 tokens (1922800 in the messages, 64000 in the completion)
+```
+
+但图片仍会随每一轮请求**全量重传**：真机实测一个会话里 11 张截图 ≈5.5MB base64，配合上面的内存放大
+×5.1~7.4，在 1GB 的机器上足以把代理顶到 `anon-rss 532MB` 并触发 **global OOM**（内核杀掉 node，
+整机假死）。`CC_MAX_TOOL_IMAGE_MB`（默认 `6`）按**从新到旧**保留到预算之内（至少保一张），被裁掉的
+替换成 `[older tool screenshot omitted: image budget exceeded]` —— 模型知道有图被丢，不会以为历史里
+本来就没图。只作用于工具截图，用户自己贴的图不受影响。
+
+> 想让模型看到全部截图就调大预算，但请按 `预算 × 并发 × 5~7` 估内存（并发见[在途上限](#在途请求上限可选)）。
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 

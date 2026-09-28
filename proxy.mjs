@@ -2685,6 +2685,45 @@ function splitToolOutput(output) {
   }
   return { text: texts.filter(Boolean).join('\n'), images };
 }
+// 单条请求内"工具截图"的总字节预算。工具截图会随每一轮请求全量重传，是内存与首字延迟的
+// 头号杀手：真机实测一个 Codex 会话里 11 张截图 ≈5.5MB base64，配合 README 记录的内存放大
+// ×5.1~7.4，把 1GB 的机器打到 global OOM（node anon-rss 532MB，内核把整机拖死）。
+// 策略：从**最新**往回保留，预算内照发，超预算的老图替换成占位说明 —— 让模型知道有图被丢，
+// 而不是以为历史里本来就没图。CC_MAX_TOOL_IMAGE_MB=0 关闭该行为。
+const MAX_TOOL_IMAGE_BYTES = (() => {
+  const mb = Number.parseFloat(process.env.CC_MAX_TOOL_IMAGE_MB ?? '6');
+  return Number.isFinite(mb) && mb > 0 ? Math.round(mb * 1024 * 1024) : 0;
+})();
+
+function trimToolImages(messages) {
+  if (!MAX_TOOL_IMAGE_BYTES) return;
+  const refs = [];
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content) if (part && part._toolImage) refs.push({ m, part });
+  }
+  if (!refs.length) return;
+  const keep = new Set();
+  let used = 0;
+  for (let i = refs.length - 1; i >= 0; i--) {           // 从最新往回挑，至少保一张
+    const len = (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
+    if (keep.size === 0 || used + len <= MAX_TOOL_IMAGE_BYTES) { keep.add(i); used += len; }
+  }
+  if (keep.size === refs.length) return;                 // 没超预算，原样不动
+  let droppedBytes = 0;
+  for (let i = 0; i < refs.length; i++) {
+    if (keep.has(i)) continue;
+    const idx = refs[i].m.content.indexOf(refs[i].part);
+    if (idx === -1) continue;
+    droppedBytes += (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
+    refs[i].m.content[idx] = { type: 'text', text: '[older tool screenshot omitted: image budget exceeded]' };
+  }
+  log('warn', 'Tool images trimmed to budget', {
+    total: refs.length, kept: keep.size, dropped: refs.length - keep.size,
+    keptBytes: used, droppedBytes, budgetBytes: MAX_TOOL_IMAGE_BYTES,
+  });
+}
+
 
 function responsesReasoningOf(item) {
   if (!item) return '';
@@ -2775,7 +2814,7 @@ function convertResponsesToChat(respReq) {
               role: 'user',
               content: [
                 { type: 'text', text: '[image returned by tool call]' },
-                ...images.map(url => ({ type: 'image_url', image_url: { url } })),
+                ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
               ],
             });
           }
@@ -2789,6 +2828,9 @@ function convertResponsesToChat(respReq) {
     }
   }
   flushPending();
+
+  // 统一裁剪工具截图（此时所有 item 都已转成 chat 形态，按顺序处理最直观）
+  trimToolImages(messages);
 
   let tools;
   if (Array.isArray(respReq.tools) && respReq.tools.length) {

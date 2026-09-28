@@ -86,3 +86,39 @@ test('工具输出文本里内联的大 data URL 也会被提出来（不只结�
     assert.equal(imageParts(msgs).length, 1);
   } finally { await s.close(); }
 });
+
+// ── 每请求截图预算（CC_MAX_TOOL_IMAGE_MB）────────────────────────
+
+test('超过预算：从最新往回保留，被裁的老图换占位说明', async () => {
+  const s = await setup({ env: { CC_MAX_TOOL_IMAGE_MB: '1' } });
+  try {
+    const img = fakePng(400 * 1024);           // 单张约 0.39MB，三张 1.17MB > 1MB 预算
+    const input = [];
+    for (let i = 0; i < 3; i++) {
+      input.push({ type: 'function_call', call_id: `call_${i}`, name: 'screenshot', arguments: '{}' });
+      input.push({ type: 'function_call_output', call_id: `call_${i}`,
+        output: [{ type: 'input_image', image_url: img }] });
+    }
+    await s.proxy.post('/v1/responses', { model: 'm', input }, AUTH);
+    const msgs = wire(s);
+    assert.equal(imageParts(msgs).length, 2, '1MB 预算应保留最新的两张（0.39 + 0.39）');
+    const placeholders = msgs.flatMap(m => Array.isArray(m.content) ? m.content : [])
+      .filter(c => c.type === 'text' && String(c.text).includes('image budget exceeded'));
+    assert.equal(placeholders.length, 1, '被裁的那张要留占位，否则模型会以为历史里本来就没图');
+  } finally { await s.close(); }
+});
+
+test('CC_MAX_TOOL_IMAGE_MB=0 关闭裁剪', async () => {
+  const s = await setup({ env: { CC_MAX_TOOL_IMAGE_MB: '0' } });
+  try {
+    const img = fakePng(400 * 1024);
+    const input = [];
+    for (let i = 0; i < 3; i++) {
+      input.push({ type: 'function_call', call_id: `call_${i}`, name: 'screenshot', arguments: '{}' });
+      input.push({ type: 'function_call_output', call_id: `call_${i}`,
+        output: [{ type: 'input_image', image_url: img }] });
+    }
+    await s.proxy.post('/v1/responses', { model: 'm', input }, AUTH);
+    assert.equal(imageParts(wire(s)).length, 3, '关掉预算后一张都不该裁');
+  } finally { await s.close(); }
+});
