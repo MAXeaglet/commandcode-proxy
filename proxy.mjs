@@ -1494,6 +1494,48 @@ async function handleChatCompletions(req, res) {
     await sleep(UPSTREAM_RETRY_BASE_MS * attempt);
   };
 
+  // 下游断连检测：打断 CC 上游 + 记录日志 —— 必须挂在重试循环**之前**、无条件注册恰好一次。
+  // #50 初版把它放在「attempt === 1 且已拿到上游响应头」的分支里：而第 1 次尝试恰恰可能在
+  // 响应头之前就闪断（这正是重试特性要处理的场景），该分支永远走不到，之后所有尝试便
+  // 再也没有断连监听 —— 客户端已断开仍会继续打上游（白烧额度 / 放大 QPS），还会把
+  // 「对着空气交付」误记成 retry recovered（issue #55）。
+  // 回调读的 abortController 是每次尝试重绑的 let，闭包取到的永远是当前尝试的控制器，
+  // 所以注册一次即可，重试不需要重复挂载。
+  res.on('close', () => {
+    if (res.writableEnded) return; // Normal completion, not a disconnect
+    aborted = true;
+    const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
+      : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
+      : 'client-hangup';
+    abortController.signal.aborted || log('warn', 'Client disconnected', {
+      path: '/v1/chat/completions',
+      model, completionId, reason,
+      streaming: stream,
+      elapsedMs: Date.now() - startTime,
+      bytesSent: bytesReceived,
+      lastCcEvent: lastCcEvent || '(none)',
+      keepaliveCount,
+      inputTokens: translator?.inputTokens ?? 0,
+      outputTokens: translator?.outputTokens ?? 0,
+      cachedInputTokens: translator?.cachedInputTokens ?? 0,
+    });
+    if (!abortController.signal.aborted) {
+      // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
+      try {
+        res.write(`data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      } catch {}
+      try { abortController.abort(); } catch {}
+    }
+  });
+
   // 上游闪断重试循环：只在「传输层闪断」且「尚未向下游写出任何字节」时
   // 才再来一遍；正常路径第一轮即 break。循环体沿用原有缩进、未做重排，只为把 diff 控到最小。
   attemptLoop: for (attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
@@ -1522,42 +1564,6 @@ async function handleChatCompletions(req, res) {
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
-
-    // 下游断连检测：打断 CC 上游 + 记录日志（只在首次尝试注册，重试不重复挂载监听器）
-    if (attempt === 1) res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
-        : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
-        : 'client-hangup';
-      abortController.signal.aborted || log('warn', 'Client disconnected', {
-        path: '/v1/chat/completions',
-        model, completionId, reason,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-        bytesSent: bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        keepaliveCount,
-        inputTokens: translator?.inputTokens ?? 0,
-        outputTokens: translator?.outputTokens ?? 0,
-        cachedInputTokens: translator?.cachedInputTokens ?? 0,
-      });
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
-        try {
-          res.write(`data: ${JSON.stringify({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
-          })}\n\n`);
-          res.write('data: [DONE]\n\n');
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-    });
 
     if (stream) {
       // ── 流式响应 ──

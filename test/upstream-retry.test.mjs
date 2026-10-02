@@ -27,6 +27,8 @@ const OK_LINES = [
  *   'fin-short'       干净收尾（对端 FIN）但没有 finish 事件 —— 上游「没走完」
  *   'error-then-cut'  先发语义 error 事件（429），再 RST
  *   'hang'            一个字都不写，用来触发空闲看门狗
+ *   'destroy-before-headers'  连响应头都不发就 RST —— fetch 直接 terminated（#55）
+ *   'destroy-before-headers-delayed' 同上，但先留出客户端断连的时间窗（#55）
  */
 async function startFlakyUpstream(script) {
   const port = await allocPort();
@@ -42,6 +44,13 @@ async function startFlakyUpstream(script) {
       }
       state.generateCalls++;
       const action = script[Math.min(state.generateCalls - 1, script.length - 1)];
+      // 这两个动作必须放在 writeHead 之前：代理侧 fetch 连响应头都拿不到、直接抛 terminated。
+      // 既有动作全都先发头（flushHeaders），恰好绕开了 #55 的监听器注册时序缺口。
+      if (action === 'destroy-before-headers') { res.socket?.destroy(); return; }
+      if (action === 'destroy-before-headers-delayed') {
+        setTimeout(() => res.socket?.destroy(), 250);
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
       res.flushHeaders();                                  // 头必须真的发出去，否则代理还卡在 fetch
       if (action === 'hang') return;                       // 已发头但一个字都不吐，等看门狗
@@ -271,5 +280,52 @@ test('客户端断连 → 打断上游且不重试', async () => {
     await sleep(300);
     assert.equal(s.mock.state.generateCalls, 1, '客户端断连后不得再发起重试');
     assert.doesNotMatch(s.proxy.logs(), /retrying/);
+  } finally { await s.close(); }
+});
+
+// ── ⑥ 首次尝试在「响应头之前」闪断：断连监听必须已就位（issue #55）──────────
+// #50 初版把 res.on('close') 挂在 attempt===1 且拿到上游响应头之后；第 1 次尝试恰恰
+// 可能在响应头之前就闪断（这正是重试特性要处理的场景），监听器便永远注册不上：
+// 之后所有尝试都看不见客户端断连 —— 已断开的客户端还会吃到后续上游调用，
+// 成功时还会被误记成 retry recovered。既有用例的 mock 全都先 flushHeaders，盖不到这里。
+
+test('#55 第 1 次尝试响应头前闪断 + 第 2 次尝试中断开 → 不再打上游，不误记 recovered', async () => {
+  const s = await setupRetry(['destroy-before-headers', 'destroy-before-headers-delayed', 'ok']);
+  try {
+    const ac = new AbortController();
+    const pending = fetch(`${s.proxy.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...AUTH },
+      body: JSON.stringify({ ...CHAT, stream: true }),
+      signal: ac.signal,
+    }).catch(() => null);
+    // 等第 2 次尝试已发出（第 1 次已在响应头前闪断并进入重试），随即断开客户端。
+    // mock 的第 2 次 250ms 后才 RST，断连有充足时间先落到代理上。
+    for (let i = 0; i < 80 && s.mock.state.generateCalls < 2; i++) await sleep(25);
+    assert.equal(s.mock.state.generateCalls, 2, '前置条件：第 2 次尝试已发起');
+    ac.abort();
+    await pending;
+    await sleep(800);   // 若监听器缺席，这里会走完「RST → 重试 → 第 3 次成功」的全流程
+    assert.equal(s.mock.state.generateCalls, 2,
+      '客户端已断连：不得再有第 3 次上游调用（=3 说明断连监听器没有注册上）');
+    await waitForLog(s.proxy, /Client disconnected/, 1, 5000);
+    assert.doesNotMatch(s.proxy.logs(), /Upstream retry recovered/,
+      '响应只写给了空气，不能记成「重试救回来了」');
+    const retries = (s.proxy.logs().match(/before first byte - retrying/g) || []).length;
+    assert.equal(retries, 1, '只有第 1 次闪断产生重试；断连后的失败不得再触发重试');
+  } finally { await s.close(); }
+});
+
+test('#55 对照：响应头前闪断 + 客户端一直在线 → 照常重试并如实记 recovered', async () => {
+  const s = await setupRetry(['destroy-before-headers', 'ok']);
+  try {
+    const r = await s.chat(true);
+    const text = await r.text();
+    assert.equal(r.status, 200, '预头闪断一样该被代理内部消化');
+    assert.match(text, /recovered/);
+    assert.equal(s.mock.state.generateCalls, 2);
+    await waitForLog(s.proxy, /Upstream error before first byte - retrying/);
+    await waitForLog(s.proxy, /Upstream retry recovered/, 1, 5000);
+    assert.doesNotMatch(s.proxy.logs(), /Client disconnected/, '客户端没走，不该有断连日志');
   } finally { await s.close(); }
 });
