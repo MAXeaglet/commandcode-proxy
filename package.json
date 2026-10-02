@@ -9,6 +9,7 @@
     "start": "node proxy.mjs",
     "dev": "node --watch proxy.mjs",
     "test": "node --test test/*.test.mjs",
+    "test:bun": "bun test",
     "docker:build": "docker build -t commandcode-proxy:latest .",
     "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy:latest ."
   },

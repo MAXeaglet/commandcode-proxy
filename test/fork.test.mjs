@@ -80,6 +80,12 @@ test('fork: 无 session 头时回落 per-key session，threadId 仍与之同值'
 });
 
 // ── issue #18：上游 HTTP(S) 代理（零依赖 CONNECT 隧道）──
+// Bun 的 node:http 基于 fetch 实现：CONNECT 方法发起即报 "fetch() URL is invalid"，
+// 且 http.request 的 createConnection 会被忽略（自建连接直连），隧道无法落地。
+// 所以两个「必须走隧道」的用例只在 Node 跑；「不走代理」的负向断言两个运行器都成立。
+const IS_BUN = !!process.versions.bun;
+const notOnBun = IS_BUN ? test.skip : test;
+
 /** 录制型 CONNECT 代理：记录每次 CONNECT 的 target，并做裸字节转发。 */
 async function startRecordingProxy() {
   const port = await allocPort();
@@ -100,7 +106,7 @@ async function startRecordingProxy() {
   return { port, connects, close: () => new Promise(r => server.close(r)) };
 }
 
-test('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', async () => {
+notOnBun('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', async () => {
   const rec = await startRecordingProxy();
   const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port,
@@ -117,7 +123,7 @@ test('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', async ()
   }
 });
 
-test('#18: 预请求也走代理（避免同一账号从两个 IP 注册）', async () => {
+notOnBun('#18: 预请求也走代理（避免同一账号从两个 IP 注册）', async () => {
   const rec = await startRecordingProxy();
   const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port,
