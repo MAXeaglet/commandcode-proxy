@@ -356,6 +356,8 @@ curl http://127.0.0.1:3050/v1/responses \
 
 上游错误体里的机器可读分类（`error.code`，如 `BAD_REQUEST` / `USAGE_EXCEEDED`）会透传到下游错误体的 `error.code`。
 
+CC 把失败放在响应流里上报，而不是总用 HTTP 状态返回：`{"type":"error","error":{...,"statusCode":N,"isRetryable":B}}`。代理会取这个状态（消息里的 `<NNN>` 前缀优先，与 CLI 一致），按与 HTTP 层错误相同的方式映射；例如上游声明的 400 / 429 会带着自己的状态到达客户端，而不是一律折叠成 502。
+
 ## 模型列表
 
 代理访问 `GET /v1/models` 会返回实时模型列表。以下为常见模型参考，完整列表以实际接口返回为准——各模型套餐可参考 [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits)。
