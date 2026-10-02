@@ -2759,6 +2759,21 @@ function responsesTextOf(content) {
   return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
 }
 
+/** `input_image` 部件（含省略 type 只带 image_url 的写法）。 */
+function isResponsesImagePart(part) {
+  return !!part && typeof part === 'object' && (part.type === 'input_image' || part.image_url !== undefined);
+}
+
+/** Responses 的图 → Chat 的 `image_url` 部件（对象形的 image_url，CC 侧读 `.url`）。 */
+function responsesImagePartsOf(parts) {
+  if (!Array.isArray(parts)) return [];
+  return parts.filter(isResponsesImagePart).map(part => {
+    const raw = part.image_url !== undefined ? part.image_url : part.input_image;
+    const url = typeof raw === 'string' ? raw : (raw && raw.url) || '';
+    return url ? { type: 'image_url', image_url: { url } } : null;
+  }).filter(Boolean);
+}
+
 // data URL 图片：一段文本里超过这个长度的 data URL 就当成"图"，提出来单独发；小图留在文本里
 const INLINE_IMAGE_MIN = 256 * 1024;
 // 单张 data URL 上限：再大就不要了，只留一句占位说明（既撑爆上游窗口，也撑爆内存）
@@ -2906,11 +2921,21 @@ function convertResponsesToChat(respReq) {
         }
         case 'message': {
           const text = responsesTextOf(item.content);
+          const images = responsesImagePartsOf(item.content);
           if (item.role === 'assistant') {
+            // assistant 消息上的图没有落点：Chat 的 assistant 内容只有文本槽
             if (text) ensurePending().content = text;
           } else if (item.role === 'system' || item.role === 'developer') {
             flushPending();
             messages.push({ role: 'system', content: text });
+          } else if (images.length) {
+            // 用户槽的图必须原样保留：CC 只收 user 角色上的图，丢掉时上游照样回 200，
+            // 客户端侧看不见任何异常（只表现为模型"没看到图"）。
+            flushPending();
+            messages.push({
+              role: 'user',
+              content: [...(text ? [{ type: 'text', text }] : []), ...images],
+            });
           } else {
             flushPending();
             messages.push({ role: 'user', content: text });
