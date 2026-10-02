@@ -3262,6 +3262,10 @@ function createResponsesSseTranslator(model, responseId, created) {
     // 这期间一个字节都不出网就会被中间层（实测 EdgeOne 源站 ~15s）或客户端首字节超时掐掉
     start: startResponse,
     get started() { return createdSent; },
+    // 是否真的产出过 output item（开过 item 或收尾过 item 都算）。
+    // #54 之后 created/in_progress 在收到 200 时就先行发出，started 恒为 true，
+    // 零输出防护不能再拿它当判据 —— 只能看「有没有实际内容」。
+    get hasOutput() { return outputIndex > 0 || doneItems.length > 0; },
     get stopReason() { return finishReason; },
     parseLine(line) {
       const trimmed = line.trim();
@@ -3545,10 +3549,22 @@ async function handleResponses(req, res) {
             }
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
-          } else if (translator.outputTokens === 0 && !translator.started) {
+          } else if (translator.outputTokens === 0 && !translator.hasOutput) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
-            sendResponsesError(res, 429, 'rate_limit_error',
-              'Empty response from upstream (zero output tokens)', 10);
+            if (!started) {
+              sendResponsesError(res, 429, 'rate_limit_error',
+                'Empty response from upstream (zero output tokens)', 10);
+              return;
+            }
+            // created 已随 200 先行发出，响应头按 200 提交后状态码改不回 429 ——
+            // 这里再调 sendResponsesError 会抛 ERR_HTTP_HEADERS_SENT（issue #56）。
+            // 按本文件既有失败口径走 response.failed：空响应绝不能经 finish() 包装成
+            // response.completed 谎报成功（与 #38/#39 修掉的静默截断同类）。
+            const failed = translator.fail('Empty response from upstream (zero output tokens)');
+            if (failed.length) await writeEvents(failed);
+            // 就地收尾：下面的 return 会跳过流式分支尾部的 res.end()，
+            // 漏掉这条客户端会挂在永不结束的 SSE 上。
+            if (!res.writableEnded) res.end();
             return;
           } else {
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }

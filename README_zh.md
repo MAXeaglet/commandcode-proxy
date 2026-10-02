@@ -6,7 +6,7 @@
 
 逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
-**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出防护（非流式 429 / 流式 response.failed）| 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -374,7 +374,7 @@ curl http://127.0.0.1:3050/v1/responses \
 | `401` | 缺 API Key / 格式不对（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入）|
 | `404` | 路径不存在 |
 | `413` | 请求体超过 `CC_MAX_BODY_MB`（连接保持可排空，不会直接 reset）|
-| `429` | 零输出 token、流空闲超时（30s 流式 / 90s 非流式）、或上游限流映射 —— 都带 `Retry-After`，SDK 自动退避重试；连续 3 次超时后提示压缩上下文 |
+| `429` | 零输出 token（仅非流式；流式为 200 + `response.failed`，见「零输出防护」）、流空闲超时（30s 流式 / 90s 非流式）、或上游限流映射 —— 都带 `Retry-After`，SDK 自动退避重试；连续 3 次超时后提示压缩上下文 |
 | `502` | CC 上游错误（`fetch failed` 这类连接层失败也走这里）|
 | `503` | 开了 `CC_MAX_INFLIGHT` 且超过在途上限（`type: server_busy`）|
 
@@ -496,7 +496,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
-| **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
+| **零输出防护** | outputTokens=0 且无任何 output item：非流式 → 429 `rate_limit_error`（SDK 自动重试，反异常计费）；流式因 `response.created` 已先行发出（#54），按 200 + `response.failed`（upstream_error）如实上报 —— 都不会把空响应包装成成功（[#56](https://github.com/MAXeaglet/commandcode-proxy/issues/56)） |
 | **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
 | **隐私保护日志** | 日志不含 API Key 片段、错误 body、stack trace |
 
