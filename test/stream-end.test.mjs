@@ -202,3 +202,119 @@ test('#38 回归：tool-calls 仍报 tool_use / tool_calls', async () => {
     assert.equal(a.json.stop_reason, 'tool_use');
   } finally { await s.close(); }
 });
+
+// 回归：#38 排查期间发现的日志噪音。上游每个响应都会发一串无内容事件
+// （text-start / text-end / start / start-step / reasoning-start / reasoning-end /
+//  provider-metadata / tool-input-* / tool-error）。三条非流式路径原先缺少静默列表，
+// 全部掉进 default 打成 'Unknown CC event type'，线上刷屏并把真正的错误淹掉。
+test('标准 NDJSON 序列不产生任何 Unknown CC event type 警告（三协议 × 流式/非流式）', async () => {
+  const s = await setup();
+  try {
+    const chat = { model: 'm', messages: [{ role: 'user', content: 'hi' }] };
+    const msg = { model: 'm', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] };
+    await (await s.proxy.post('/v1/chat/completions', { ...chat, stream: true }, AUTH)).text();
+    await (await s.proxy.post('/v1/chat/completions', chat, AUTH)).text();
+    await (await s.proxy.post('/v1/messages', { ...msg, stream: true }, { 'x-api-key': 'user_test' })).text();
+    await (await s.proxy.post('/v1/messages', msg, { 'x-api-key': 'user_test' })).text();
+    await (await s.proxy.post('/v1/responses', { model: 'm', stream: true, input: 'hi' }, AUTH)).text();
+    await (await s.proxy.post('/v1/responses', { model: 'm', input: 'hi' }, AUTH)).text();
+
+    const logs = s.proxy.logs();
+    assert.ok(!logs.includes('Unknown CC event type'),
+      '不应出现 Unknown CC event type 警告，实际日志片段：\n' +
+      logs.split('\n').filter(l => l.includes('Unknown CC')).join('\n'));
+  } finally { await s.close(); }
+});
+
+
+// 上游 error 事件自带 statusCode 时必须用它 —— CLI 的 readStreamErrorEvent 读的就是这个字段，
+// 取值链是 parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null。
+// 原实现只看 message 里的 "<NNN>" 前缀，statusCode 全被丢掉 → 429/503 塌成 502。
+test('#38 error 事件带 statusCode 时按其映射（429 而非 502）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"text-delta","text":"partial"}',
+    '{"type":"error","error":{"message":"providers are currently at capacity","statusCode":429}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    const j = await r.json();
+    assert.equal(r.status, 429, 'statusCode 是上游给的，不能抹成 502');
+    assert.equal(j.error.type, 'rate_limit_error');
+    assert.equal(j.retry_after, 30, '429 要带退避提示，否则客户端不知道等多久');
+  } finally { await s.close(); }
+});
+
+test('#38 error 事件带 statusCode 时按其映射（503 而非 502）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"error","error":{"message":"service unavailable","statusCode":503}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    assert.equal(r.status, 503);
+  } finally { await s.close(); }
+});
+
+test('#38 error 事件没有 statusCode 时仍回落 502（保持原行为）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"error","error":{"message":"something broke"}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    assert.equal(r.status, 502);
+  } finally { await s.close(); }
+});
+
+test('#38 message 里的 "<NNN>" 前缀优先于 statusCode（对齐 CLI 的取值链）', async () => {
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"error","error":{"message":"<400> bad request","statusCode":503}}',
+  ] });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', CHAT, AUTH);
+    assert.equal(r.status, 400, '<NNN> 前缀是最优先的取值来源');
+  } finally { await s.close(); }
+});
+
+
+// 流空闲超时后必须以 end() 收尾。原先走的是 res.write(err) 紧跟 res.destroy()：
+// write 是异步的，destroy 会把未刷出的缓冲丢掉并发 RST，反向代理那里就是
+// "upstream prematurely closed connection" → 502，或者客户端看到 connection error。
+// 断言方式：客户端必须能**完整读到**已产生的 delta 与超时错误事件 —— destroy 会让
+// 这条读挂掉（ECONNRESET / 截断），end 则正常收束。
+test('流空闲超时：已产生的内容 + 错误事件都能完整送达（不能 destroy 客户端 socket）', async () => {
+  const s = await setup({
+    env: { CC_STREAM_IDLE_MS: '300' },
+    onRequest: (req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('{"type":"text-start"}\n');
+      res.write('{"type":"text-delta","text":"partial-content"}\n');
+      return true;   // 接管后挂住：不再发任何数据 → 触发空闲超时
+    },
+  });
+  try {
+    const r = await s.proxy.post('/v1/chat/completions', { ...CHAT, stream: true }, AUTH);
+    const text = await r.text();
+    assert.equal(r.status, 200);
+    assert.ok(text.includes('partial-content'), '已发出的内容不能因为收尾方式而丢失');
+    assert.ok(text.includes('rate_limit_error'), '超时错误事件必须完整送进流里');
+  } finally { await s.close(); }
+});
+
+
+// 反代场景的 keep-alive 时序：Node 的 keepAliveTimeout 必须**大于**反代的
+// upstream keepalive_timeout。否则反代会复用后端已关闭的连接，写请求体时吃 EPIPE，
+// 而 POST 是非幂等、nginx 默认不重试 → 客户端直接 502。
+test('启动时显式设置 keepAliveTimeout 并打出（反代 keepalive_timeout 必须小于它）', async () => {
+  const s = await setup();
+  try {
+    const logs = s.proxy.logs();
+    assert.ok(/keepAliveTimeout[":\s]+65000ms/.test(logs),
+      '启动横幅必须打出 keepAliveTimeout，便于和反代配置对齐。实际：\n' +
+      logs.split('\n').filter(l => l.includes('CC Proxy started')).join('\n'));
+    assert.ok(logs.includes('keepalive_timeout'), '横幅里要提示反代侧的对应设置');
+  } finally { await s.close(); }
+});
+
