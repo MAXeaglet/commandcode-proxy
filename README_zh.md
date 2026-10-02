@@ -6,7 +6,7 @@
 
 逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
-**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出防护（非流式 429 / 流式 response.failed）| 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -102,6 +102,40 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
 
+### 设备指纹
+
+相关配置：`fingerprintSalt` / `CC_FINGERPRINT_SALT`、`deviceProjectDir` / `CC_DEVICE_PROJECT_DIR`。
+
+上报给 `/alpha/fingerprint/record` 的设备指纹由 API key **确定性派生**（`fpDigest(apiKey, field) = sha256(salt + "\\0" + apiKey + "\\0" + field)`），因此一个 key 恒定对应一台设备：
+
+| 事件 | 原行为（随机） | 现行为（派生） |
+|---|---|---|
+| 进程重启 | Map 清空 → **换一台机器** | 同一台机器 |
+| 第二个实例 | 同一 key = **两台机器** | 同一台机器 |
+| session 过期（12h） | `keyStateStore.delete` → **每 12h 换一台机器** | 同一台机器 |
+
+> 12h 那条最明显：真实用户不会一天换两次电脑。而上游 `device_fingerprints` 表是按 `(userId, thumbmark)` 建唯一索引的。
+
+**为什么用「派生」而不是「按哈希取桶选设备」** —— 固定池的熵上限就是池的大小，key 数一旦超过池容量，多个 key 就**必然**共用指纹：约 50 个 key 配 1000 个池 → 约 2 个碰撞；配 100 个池 → 约 20 个碰撞。同一个 `thumbmark` 出现在两个不同 `userId` 下，就是「多账号同机」的直接证据 —— 这正是最不该主动制造的东西。派生方案每个 key 仍是独立设备（碰撞概率 2⁻²⁵⁶），同时保持稳定。
+
+```bash
+CC_FINGERPRINT_SALT=some-local-secret npm start   # 可选：成批更换所有 key 的设备身份
+CC_DEVICE_PROJECT_DIR='C:\\Users\\you\\projects\\app' npm start   # 可选：改伪造的项目目录（slug 随之改变）
+```
+
+盐是可选的但建议设：不设时派生是 API key 的纯函数，知道算法的人可以反推出你所有用户的指纹；设了之后同一个 key 在不同部署上得到不同设备，且没有额外成本。
+
+**信号值也是伪造的**：上游 CLI 读真实机器（Windows 注册表 MachineGuid、网卡 MAC、`os.userInfo`、`git config`），本代理按 API key 派生出一组**形状逼真**的替代值 —— MachineGuid 的 `8-4-4-4-12` 形状、`xx:xx:xx:xx:xx:xx` 的 MAC、`DESKTOP-xxxxxx` 主机名、可读的 git 邮箱。这些原始值只存在于进程内存，出网的只有它们的哈希。
+
+**候选池选取用「打分取最大」而非取模** —— 取模在池子扩容时会让**所有** key 一起换设备；打分取最大只影响「新候选恰好胜出」的那部分 key。
+
+哈希构造对齐官方 CLI（`command-code` 的 `buildMachineFingerprint` / `hashSignal`）：`thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))`，其中 `IB = "command-code:device-fingerprint:v1"`；各 component 按 `sha256(IB + "\0" + value.toLowerCase())` 计算。原实现直接对随机 hex 求 sha256（缺 `IB` 前缀），且 thumbmark 由各 component 的**哈希**拼成 —— 上游两种都无从验算（它拿不到原始 `machineId`），所以检测不到；现在已对齐。
+
+> 本次未处理：外观池仍是清一色高端桌面 CPU，时区仍从全球池里均匀取。
+>
+> `timezone` 是**客户端本机操作系统的时区**（`Intl.DateTimeFormat().resolvedOptions().timeZone`），**不是出口 IP 的时区**。所以**不要**把它绑定到出口 IP：中国大陆用户通过代理访问本服务时，本机时区与流量出口地不一致是**常态而非异常**。
+>
+> 真正有意义的性质是**它在你自身用户群里的分布**，而不是与 IP 是否一致。如果你的用户集中在一个地区，却从 15 个全球时区里均匀取，就会让每个账号看起来来自不同的大洲。应当让池子匹配实际使用这个部署的人群 —— 这是运维决策：单一地区用户群应当收窄（或加权）`FINGERPRINT_TZS`，而不是全球随机。
 ### 工具截图预算
 
 工具结果里的图片会**单独**作为 `image` 块发给上游（`function_call_output.output` 里的 `input_image`
@@ -340,7 +374,7 @@ curl http://127.0.0.1:3050/v1/responses \
 | `401` | 缺 API Key / 格式不对（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入）|
 | `404` | 路径不存在 |
 | `413` | 请求体超过 `CC_MAX_BODY_MB`（连接保持可排空，不会直接 reset）|
-| `429` | 零输出 token、流空闲超时（30s 流式 / 90s 非流式）、或上游限流映射 —— 都带 `Retry-After`，SDK 自动退避重试；连续 3 次超时后提示压缩上下文 |
+| `429` | 零输出 token（仅非流式；流式为 200 + `response.failed`，见「零输出防护」）、流空闲超时（30s 流式 / 90s 非流式）、或上游限流映射 —— 都带 `Retry-After`，SDK 自动退避重试；连续 3 次超时后提示压缩上下文 |
 | `502` | CC 上游错误（`fetch failed` 这类连接层失败也走这里）|
 | `503` | 开了 `CC_MAX_INFLIGHT` 且超过在途上限（`type: server_busy`）|
 
@@ -450,7 +484,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | 机制 | 实现 |
 |------|------|
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
-| **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`）|
+| **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`），与生成请求共用 `User-Agent: cli` |
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
 | **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.53.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
 | **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
@@ -462,7 +496,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
-| **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
+| **零输出防护** | outputTokens=0 且无任何 output item：非流式 → 429 `rate_limit_error`（SDK 自动重试，反异常计费）；流式因 `response.created` 已先行发出（#54），按 200 + `response.failed`（upstream_error）如实上报 —— 都不会把空响应包装成成功（[#56](https://github.com/MAXeaglet/commandcode-proxy/issues/56)） |
 | **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
 | **隐私保护日志** | 日志不含 API Key 片段、错误 body、stack trace |
 
@@ -584,6 +618,8 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 
 **为什么需要它**：内存 = `在途数 × (0.13MB + 5.5 × body_MB)`。`CC_MAX_BODY_MB` 只管住**单请求**量级，乘数无人管 —— 默认 100MB 时 N 个并发最坏可达 N × 550MB。
 
+> **为什么 body 默认值保持 100MB**：[#7](https://github.com/MAXeaglet/commandcode-proxy/issues/7) 记录了一个合法的多模态长会话（21 张 base64 图片，约 10.11 MiB）会撞上旧的 10MB 上限 —— 阈值降不下去，正因为此才必须去约束并发侧。启动时那条「最坏内存」warn 只是提示，`CC_MAX_INFLIGHT` 才是执行层。
+
 > ⚠️ 开启本项**不等于**内存安全：32 × 550MB 仍远超小机器容量。要拿到硬性上界，需**同时**下调 `CC_MAX_BODY_MB`。
 
 ## 上游空闲超时
@@ -682,7 +718,7 @@ body 在转发到上游前同时存在多份副本：`chunks[]` / `Buffer.concat
 | 20 MB | 100 MB | +116 MB（5.8×）| 200 |
 | 20 MB | 8 MB | +21 MB（1.05×）| **413** |
 
-启动时若隐含最坏峰值 ≥ 500MB，日志会输出 `warn` 提示。上限是**按请求**的，proxy 自身没有在途限流 —— 公网部署必须在反向代理层补上。
+启动时若隐含最坏峰值 ≥ 500MB，日志会输出 `warn` 提示。body 上限是**按请求**的 —— 乘数用 `CC_MAX_INFLIGHT`（进程内、仅全局）封顶，按 IP / 按 key 的限流在反向代理层补上。公网部署建议两者都做。
 
 ### nginx 反代建议
 
@@ -744,7 +780,7 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 
 - **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
 - **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
-- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
+- **多账号 + 多实例**：`sessionStore` 仍是进程内 `Map`，同一个 API key 打到两个实例会得到两个不同 session。**设备指纹已不再是问题** —— 它现在是派生出来的，跨实例、跨重启都是同一台设备（见[设备指纹](#设备指纹)）。横向扩展仍建议按 API key 做一致性哈希（`hash $cc_key consistent`）以保持 session 亲和，不要轮询。
 
 ## 免责声明
 

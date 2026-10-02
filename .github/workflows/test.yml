@@ -1,0 +1,65 @@
+name: Test
+
+on:
+  push:
+    # 只在这些长期分支上跑 push；其余分支靠 pull_request 触发，避免同一提交跑两遍
+    branches: [master, release]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消旧运行，避免排队浪费
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 是 Dockerfile 的构建版本；24 是生产部署版本（systemd 里跑的就是 v24.x）。
+        # 18/20 不再覆盖，engines >=18 仅作声明；另由 test-bun 覆盖 Bun 运行时。
+        node: ['22', '24']
+    name: node ${{ matrix.node }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Show Node version
+        run: node --version
+
+      - name: Syntax check
+        run: node --check proxy.mjs
+
+      - name: Run tests
+        run: npm test
+
+  test-bun:
+    # 社区用户有用 Bun 跑本代理的场景，单独用 Bun 跑一轮测试套件；
+    # 被测子进程经 process.execPath 派生，Bun 下整条链路都是 Bun。
+    # Bun 缺失的能力（node:http 不支持 CONNECT）在 test/fork.test.mjs 里显式跳过。
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: bun
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Show Bun version
+        run: bun --version
+
+      - name: Run tests
+        run: bun test
