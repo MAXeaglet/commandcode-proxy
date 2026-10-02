@@ -270,6 +270,35 @@ const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
   return Number.isFinite(ms) && ms > 0 ? ms : 90000;   // 默认 90s — 非流式超时更宽容
 })();
 
+// ── 上游闪断透明重试（未吐字前 bounded retry）─────────
+// CC 上游在高峰期会中途掐断流，undici 抛 `TypeError: terminated`
+// （cause 多为 SocketError: other side closed）。若此刻尚未向下游写出任何字节，
+// 这个请求对下游而言从未开始过 —— 代理内部重试即可消化抖动，下游（CPA / 客户端）
+// 不必看到 502 再自行退避。
+// 只在「未吐字」时重试：一旦写过头或输出过事件，语义就已提交，重试会造成重复文本。
+// 默认 2 = 最多重试 2 次（共 3 次尝试）；CC_UPSTREAM_RETRY_MAX=0 可整体关闭。
+const UPSTREAM_RETRY_MAX = (() => {
+  const n = Number.parseInt(process.env.CC_UPSTREAM_RETRY_MAX ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 2;
+})();
+const UPSTREAM_RETRY_BASE_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_UPSTREAM_RETRY_BASE_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 400;   // 退避 = base × 尝试序号
+})();
+
+// 区分「传输层闪断」（可安全重试）与「语义错误」（不可重试）。
+// STREAM_IDLE_TIMEOUT 是刻意发给下游的「请减少上下文」信号，绝不重试。
+function isRetryableUpstreamError(e) {
+  if (!e) return false;
+  const blob = [e.message, e.code, e.cause?.message, e.cause?.code].filter(Boolean).join(' | ');
+  if (/STREAM_IDLE_TIMEOUT/.test(blob)) return false;
+  return /terminated|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|UND_ERR_SOCKET|socket hang up|other side closed|fetch failed/i.test(blob);
+}
+
+// 仅用于日志：rewinds = 实际重试次数，recovered = 重试后成功交付的次数
+const upstreamRetryStats = { rewinds: 0, recovered: 0 };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // 客户端「僵死」保护：既不读也不断开时，该请求会连带上游连接一直挂着（背压修复后的残留）。
 // 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
 // 默认 0 = 禁用，保持既有行为不变：僵死客户端与「卡在工具执行的合法客户端」在协议层无法
@@ -1227,12 +1256,25 @@ function getApiKey(headers) {
 const UPSTREAM_PROXY = CFG.upstreamProxy || '';
 const PROXY_CONNECT_TIMEOUT_MS = 15000;
 
+// 代理 URL 可能带 user:pass —— 任何日志/错误消息都只允许出现 host:port。
+// （README 承诺「隐私保护日志」，把口令打进启动横幅是直接违反。）
+function redactProxyUrl(raw) {
+  if (!raw) return '(direct)';
+  try {
+    const u = new URL(raw);
+    return `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`;
+  } catch {
+    return '(invalid upstreamProxy)';
+  }
+}
+
 function parseProxyUrl(raw) {
   let u;
   try {
     u = new URL(raw);
   } catch {
-    throw new Error(`upstreamProxy is not a valid URL: ${raw}`);
+    // 不回显原串：里面可能就是口令
+    throw new Error('upstreamProxy is not a valid URL (expected http://host:port)');
   }
   if (u.protocol !== 'http:') {
     throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
@@ -1241,6 +1283,21 @@ function parseProxyUrl(raw) {
     ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
     : null;
   return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
+}
+
+// 启动即校验：写错的代理地址应当立刻拒绝启动，而不是每个请求各 502 一次。
+if (UPSTREAM_PROXY) {
+  try {
+    parseProxyUrl(UPSTREAM_PROXY);
+  } catch (e) {
+    log('error', 'Invalid upstreamProxy, refusing to start', {
+      error: e.message, value: redactProxyUrl(UPSTREAM_PROXY),
+    });
+    process.exit(1);
+  }
+  log('info', 'Upstream requests will go through the configured proxy', {
+    proxy: redactProxyUrl(UPSTREAM_PROXY),
+  });
 }
 
 /** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
@@ -1309,7 +1366,11 @@ async function proxyFetch(urlStr, options = {}) {
       headers: options.headers || {},
       createConnection: () => socket,
     }, (res) => {
-      resolve(new Response(Readable.toWeb(res), {
+      // 204/205/304 按规范不允许带 body，Response 构造器会直接抛 —— 这两个状态必须传 null，
+      // 同时把连接排空，避免隧道 socket 悬着。
+      const nullBodyStatus = res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304;
+      if (nullBodyStatus) { try { res.resume(); } catch {} }
+      resolve(new Response(nullBodyStatus ? null : Readable.toWeb(res), {
         status: res.statusCode,
         statusText: res.statusMessage,
         headers: headersToInit(res.headers),
@@ -1404,13 +1465,49 @@ async function handleChatCompletions(req, res) {
   openaiReq = null;
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
-  const abortController = new AbortController();
+  // 每次尝试都换一个新的（已 abort 的 signal 不可复用）
+  let abortController = new AbortController();
   let aborted = false;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
   let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
   let reader = null;
   let translator = null;
+  let attempt = 0;
+  let upstreamError = null;   // 非流式路径解析出的上游语义错误（error 事件）
+  let delivered = false;      // 本次尝试是否真的把正常响应交付给了下游（用于重试后的日志/计数）
+
+  // 发起下一次尝试前，把本次尝试的上游连接收干净并记账。
+  // 只在「下游尚未收到任何字节」时调用 —— 下游没有开始过，重试才是无损的。
+  const rewindAttempt = async (message, fields) => {
+    try { reader?.cancel().catch(() => {}); } catch {}
+    try { abortController.abort(); } catch {}
+    upstreamRetryStats.rewinds++;
+    log('warn', message, {
+      path: '/v1/chat/completions',
+      model,
+      attempt,
+      maxAttempts: UPSTREAM_RETRY_MAX + 1,
+      elapsedMs: Date.now() - startTime,
+      ...fields,
+    });
+    await sleep(UPSTREAM_RETRY_BASE_MS * attempt);
+  };
+
+  // 上游闪断重试循环：只在「传输层闪断」且「尚未向下游写出任何字节」时
+  // 才再来一遍；正常路径第一轮即 break。循环体沿用原有缩进、未做重排，只为把 diff 控到最小。
+  attemptLoop: for (attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
+  // 退避期间客户端断开了：下游已经走了，再打一次上游只是白烧额度
+  if (attempt > 1 && aborted) {
+    log('info', 'Upstream retry abandoned (client disconnected during backoff)', {
+      path: '/v1/chat/completions', model, attempt, elapsedMs: Date.now() - startTime,
+    });
+    return;
+  }
+  // 每次尝试开始：重置本次请求的状态（上一次可能已被中断 / 半途失败）
+  abortController = new AbortController();
+  bytesReceived = 0; lastCcEvent = ''; keepaliveCount = 0; fullText = '';
+  reader = null; translator = null; upstreamError = null; delivered = false;
 
   try {
     // 首次初始化（fingerprint + lifecycle）
@@ -1426,8 +1523,8 @@ async function handleChatCompletions(req, res) {
       return;
     }
 
-    // 下游断连检测：打断 CC 上游 + 记录日志
-    res.on('close', () => {
+    // 下游断连检测：打断 CC 上游 + 记录日志（只在首次尝试注册，重试不重复挂载监听器）
+    if (attempt === 1) res.on('close', () => {
       if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
       const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
@@ -1540,6 +1637,12 @@ async function handleChatCompletions(req, res) {
           // 零输出只是它的表象（此时按 429 报会掩盖真实原因）。
           } else if (translator.incompleteDetail()) {
             const detail = translator.incompleteDetail();
+            // 对端 FIN（干净收尾、没有 finish 事件）与 RST 是同一类闪断：既然还没向下游吐过
+            // 字节，就先内部重试，而不是直接把 502 交给下游去自行重发整个上下文。
+            if (!started && !aborted && attempt <= UPSTREAM_RETRY_MAX) {
+              await rewindAttempt('Upstream stream ended incomplete before first byte - retrying', { reason: detail });
+              continue attemptLoop;
+            }
             log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: detail });
             const err = incompleteUpstreamError(detail);
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1564,12 +1667,14 @@ async function handleChatCompletions(req, res) {
               started = true;
             }
             res.write(translator.getDoneEvent());
+            delivered = true;
           }
         }
       } catch (e) {
         if (aborted) {
           // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
-          try { reader.cancel(); } catch {}
+          // cancel() 返回 promise：不接住的话，连接已被对端掐断时会抛 UnhandledPromiseRejection
+          try { reader.cancel().catch(() => {}); } catch {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             path: '/v1/chat/completions',
@@ -1584,7 +1689,7 @@ async function handleChatCompletions(req, res) {
             outputTokens: translator.outputTokens,
             cachedInputTokens: translator.cachedInputTokens,
           });
-          try { reader.cancel(); } catch {}
+          try { reader.cancel().catch(() => {}); } catch {}
           try { abortController.abort(); } catch {} // 打断 CC 上游，避免浪费 token
           consecutiveTimeouts++;
           const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -1602,7 +1707,23 @@ async function handleChatCompletions(req, res) {
             // 下游若已僵死（不读也不断），由 CLIENT_DRAIN_TIMEOUT_MS 那条路径负责兜底。
             try { res.end(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
           }
+        // 已经解析出上游语义错误（429/503 等）时不重试：那是有意传下来的信号，重试会把它吞掉
+        } else if (!started && !aborted && !translator?.upstreamError
+                   && attempt <= UPSTREAM_RETRY_MAX && isRetryableUpstreamError(e)) {
+          // 传输层闪断且尚未向下游写过任何字节 → 代理内部静默重试（下游全程无感）
+          await rewindAttempt('Upstream stream terminated before first byte - retrying', {
+            message: e.message,
+            cause: e.cause?.code || e.cause?.message || '(none)',
+          });
+          continue attemptLoop;
         } else {
+          // 传输层错误不要覆盖已经解析到的语义错误：把「上游容量不足」说成「代理挂了」是误导
+          if (translator?.upstreamError && !started) {
+            log('warn', 'Upstream terminated after a parsed semantic error', { message: e.message });
+            try { abortController.abort(); } catch {}
+            sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
+            return;
+          }
           log('error', 'Stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
@@ -1625,7 +1746,6 @@ async function handleChatCompletions(req, res) {
       let sawFinish = false;
       let usage = null;
       let toolCalls = null;
-      let upstreamError = null;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1691,17 +1811,22 @@ async function handleChatCompletions(req, res) {
       };
 
       const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
-      while (true) {
-        const result = await Promise.race([reader.read(), idle.arm()]);
-        const { done, value } = result;
-        if (done) break;
-        bytesReceived += value.length;
-        const chunkText = decoder.decode(value, { stream: true });
-        buf += chunkText;
-        // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
-        if (chunkText.indexOf('\n') !== -1) processLines();
+      // 读循环抛错（闪断）时也必须释放看门狗：否则每次失败尝试都会留下一个 armed 的定时器，
+      // 重试期间累积（流式路径的 finally 已覆盖同一件事）
+      try {
+        while (true) {
+          const result = await Promise.race([reader.read(), idle.arm()]);
+          const { done, value } = result;
+          if (done) break;
+          bytesReceived += value.length;
+          const chunkText = decoder.decode(value, { stream: true });
+          buf += chunkText;
+          // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
+          if (chunkText.indexOf('\n') !== -1) processLines();
+        }
+      } finally {
+        idle.dispose();
       }
-      idle.dispose();
       processLines();
 
       if (upstreamError) {
@@ -1712,6 +1837,11 @@ async function handleChatCompletions(req, res) {
       // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
       const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
       if (incomplete) {
+        // 尚未向下游写过任何字节（非流式此时 headers 还没发）→ 与传输层闪断同等对待，先重试
+        if (!aborted && !upstreamError && attempt <= UPSTREAM_RETRY_MAX) {
+          await rewindAttempt('Upstream stream ended incomplete before first byte - retrying', { reason: incomplete });
+          continue attemptLoop;
+        }
         log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: incomplete });
         const err = incompleteUpstreamError(incomplete);
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1752,7 +1882,17 @@ async function handleChatCompletions(req, res) {
       };
     })(),
       });
+      delivered = true;
     }
+    // 只有本次尝试真的交付了正常响应才算「重试救回来了」；
+    // 已向下游报错的尝试（502/429）不能记成 recovered
+    if (attempt > 1 && delivered) {
+      upstreamRetryStats.recovered++;
+      log('info', 'Upstream retry recovered', {
+        path: '/v1/chat/completions', model, attempt, elapsedMs: Date.now() - startTime,
+      });
+    }
+    break attemptLoop;   // 本次尝试已完整处理（成功或已按语义返回错误）
   } catch (e) {
     if (abortController.signal.aborted) {
       log('warn', 'Request cancelled (client disconnected before CC response)', {
@@ -1760,6 +1900,7 @@ async function handleChatCompletions(req, res) {
         model,
         completionId,
       });
+      return; // 下游已断连：不再重试（res 已关闭）
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
         path: '/v1/chat/completions',
@@ -1772,7 +1913,7 @@ async function handleChatCompletions(req, res) {
         lastCcEvent: lastCcEvent || '(none)',
         partialLen: fullText ? fullText.length : 0,
       });
-      try { reader?.cancel(); } catch {}
+      try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
       consecutiveTimeouts++;
       const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -1780,12 +1921,32 @@ async function handleChatCompletions(req, res) {
         : 'Response timeout - request timed out';
       res.setHeader('Retry-After', '5');
       sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+      return; // 超时已按语义回给下游（由下游决定是否重试），本代理不重试
+    // 已解析出上游语义错误（429/503 等）时不重试：那是有意传下来的信号，重试会把它吞掉
+    } else if (!res.headersSent && !aborted && !upstreamError && !translator?.upstreamError
+               && attempt <= UPSTREAM_RETRY_MAX && isRetryableUpstreamError(e)) {
+      // 传输层闪断且尚未向下游写出任何字节 → 代理内部静默重试（下游全程无感）
+      await rewindAttempt('Upstream error before first byte - retrying', {
+        message: e.message,
+        cause: e.cause?.code || e.cause?.message || '(none)',
+      });
+      continue attemptLoop;
     } else {
+      // 传输层错误不要覆盖已经解析到的语义错误：把「上游容量不足」说成「代理挂了」是误导
+      const semantic = upstreamError || translator?.upstreamError;
+      if (semantic && !res.headersSent) {
+        log('warn', 'Upstream terminated after a parsed semantic error', { message: e.message });
+        try { abortController.abort(); } catch {}
+        sendJSON(res, semantic.status, semantic.body);
+        return;
+      }
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+      return;
     }
   }
+  }   // ← end of attemptLoop
 }
 
 // ── Anthropic /v1/messages 协议转换 ─────────────────
@@ -2270,7 +2431,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   } finally {
     // 确保流中断时通知上游
     idle.dispose();
-    try { reader.cancel(); } catch {}
+    try { reader.cancel().catch(() => {}); } catch {}
   }
 }
 
@@ -2624,7 +2785,7 @@ async function handleMessages(req, res) {
         lastCcEvent: lastCcEvent || '(none)',
         partialLen: fullText ? fullText.length : 0,
       });
-      try { reader?.cancel(); } catch {}
+      try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
       consecutiveTimeouts++;
       const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -2695,6 +2856,101 @@ function responsesTextOf(content) {
   if (!Array.isArray(content)) return '';
   return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
 }
+
+// data URL 图片：一段文本里超过这个长度的 data URL 就当成"图"，提出来单独发；小图留在文本里
+const INLINE_IMAGE_MIN = 256 * 1024;
+// 单张 data URL 上限：再大就不要了，只留一句占位说明（既撑爆上游窗口，也撑爆内存）
+const MAX_TOOL_IMAGE_URL = 12 * 1024 * 1024;
+const DATA_URL_RE = /data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi;
+
+// 从一段文本里捞出体积可观的 data URL 图片，原地替换成 [image] 占位。
+// 必要性：base64 一旦被上游按**文本**分词就极其昂贵 —— 真机实测单张 2.76MB 截图 ≈ 1.92M token。
+function extractInlineImages(text) {
+  const images = [];
+  const stripped = String(text).replace(DATA_URL_RE, (url) => {
+    if (url.length < INLINE_IMAGE_MIN) return url;          // 小图留文本，别把工具输出切碎
+    if (url.length > MAX_TOOL_IMAGE_URL) return '[image omitted: too large]';
+    images.push(url);
+    return '[image]';
+  });
+  return { text: stripped, images };
+}
+
+// Responses 的 function_call_output.output 可能是字符串，也可能是内容块数组；后者能带图。
+// Codex Desktop 的截图工具就是 [{type:'input_image', image_url:'data:image/png;base64,...'}]。
+// 返回 { text, images }，images 为 data URL 字符串数组。
+function splitToolOutput(output) {
+  if (output === undefined || output === null) return { text: '', images: [] };
+  const texts = [];
+  const images = [];
+  const pushText = (raw) => {
+    const r = extractInlineImages(raw);
+    if (r.text) texts.push(r.text);
+    images.push(...r.images);
+  };
+  if (typeof output === 'string') {
+    pushText(output);
+  } else if (Array.isArray(output)) {
+    for (const part of output) {
+      if (!part) continue;
+      if (part.type === 'input_image' || part.type === 'image_url') {
+        const url = typeof part.image_url === 'string' ? part.image_url : (part.image_url && part.image_url.url) || '';
+        if (url.startsWith('data:')) {
+          if (url.length <= MAX_TOOL_IMAGE_URL) images.push(url);
+          else texts.push('[image omitted: too large]');
+        } else if (url) {
+          texts.push(`[image: ${url}]`);      // 外链图上游不认，只能留个说明
+        }
+      } else if (typeof part.text === 'string') {
+        pushText(part.text);
+      } else {
+        pushText(JSON.stringify(part));       // 未知块保持原样，与旧行为一致
+      }
+    }
+  } else {
+    pushText(JSON.stringify(output));
+  }
+  return { text: texts.filter(Boolean).join('\n'), images };
+}
+// 单条请求内"工具截图"的总字节预算。工具截图会随每一轮请求全量重传，是内存与首字延迟的
+// 头号杀手：真机实测一个 Codex 会话里 11 张截图 ≈5.5MB base64，配合 README 记录的内存放大
+// ×5.1~7.4，把 1GB 的机器打到 global OOM（node anon-rss 532MB，内核把整机拖死）。
+// 策略：从**最新**往回保留，预算内照发，超预算的老图替换成占位说明 —— 让模型知道有图被丢，
+// 而不是以为历史里本来就没图。CC_MAX_TOOL_IMAGE_MB=0 关闭该行为。
+const MAX_TOOL_IMAGE_BYTES = (() => {
+  const mb = Number.parseFloat(process.env.CC_MAX_TOOL_IMAGE_MB ?? '6');
+  return Number.isFinite(mb) && mb > 0 ? Math.round(mb * 1024 * 1024) : 0;
+})();
+
+function trimToolImages(messages) {
+  if (!MAX_TOOL_IMAGE_BYTES) return;
+  const refs = [];
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content) if (part && part._toolImage) refs.push({ m, part });
+  }
+  if (!refs.length) return;
+  const keep = new Set();
+  let used = 0;
+  for (let i = refs.length - 1; i >= 0; i--) {           // 从最新往回挑，至少保一张
+    const len = (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
+    if (keep.size === 0 || used + len <= MAX_TOOL_IMAGE_BYTES) { keep.add(i); used += len; }
+  }
+  if (keep.size === refs.length) return;                 // 没超预算，原样不动
+  let droppedBytes = 0;
+  for (let i = 0; i < refs.length; i++) {
+    if (keep.has(i)) continue;
+    const idx = refs[i].m.content.indexOf(refs[i].part);
+    if (idx === -1) continue;
+    droppedBytes += (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
+    refs[i].m.content[idx] = { type: 'text', text: '[older tool screenshot omitted: image budget exceeded]' };
+  }
+  log('warn', 'Tool images trimmed to budget', {
+    total: refs.length, kept: keep.size, dropped: refs.length - keep.size,
+    keptBytes: used, droppedBytes, budgetBytes: MAX_TOOL_IMAGE_BYTES,
+  });
+}
+
 
 function responsesReasoningOf(item) {
   if (!item) return '';
@@ -2769,11 +3025,26 @@ function convertResponsesToChat(respReq) {
         }
         case 'function_call_output': {
           flushPending();
-          messages.push({
-            role: 'tool',
-            tool_call_id: item.call_id || '',
-            content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output === undefined ? '' : item.output),
-          });
+          // 工具结果里可能带图（Codex Desktop 截图工具即 output=[{type:'input_image', image_url:'data:image/png;base64,...'}]）。
+          // 绝不能 JSON.stringify 成文本送上游：base64 会按文本分词，真机实测单张 2.76MB 截图 ≈ 1.92M token，
+          // 直接撞穿模型 1M 窗口（"maximum context length is 1048576 tokens ... 1922800 in the messages"）。
+          // 官方 CLI 的排布是：tool-result 只放文本，图片提出来放进紧跟其后的一条 user 消息
+          // （见 command-code@1.66.0 dist/cli.mjs 的 convertUserMessage / tool_result 分支）。
+          const { text, images } = splitToolOutput(item.output);
+          messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
+          if (images.length) {
+            log('info', 'Hoisted tool-output images to user message', {
+              count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
+            });
+            // content 走 image_url 形态，交给 buildCcRequest 里已验证的 user 图片分支转成 CC 的 {type:'image',image,mimeType}
+            messages.push({
+              role: 'user',
+              content: [
+                { type: 'text', text: '[image returned by tool call]' },
+                ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
+              ],
+            });
+          }
           break;
         }
         default: {
@@ -2784,6 +3055,9 @@ function convertResponsesToChat(respReq) {
     }
   }
   flushPending();
+
+  // 统一裁剪工具截图（此时所有 item 都已转成 chat 形态，按顺序处理最直观）
+  trimToolImages(messages);
 
   let tools;
   if (Array.isArray(respReq.tools) && respReq.tools.length) {
@@ -2984,6 +3258,9 @@ function createResponsesSseTranslator(model, responseId, created) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    // 提前发 created/in_progress（不带内容）：上游是 reasoning 模型，大 prompt 首字可能要十几秒，
+    // 这期间一个字节都不出网就会被中间层（实测 EdgeOne 源站 ~15s）或客户端首字节超时掐掉
+    start: startResponse,
     get started() { return createdSent; },
     get stopReason() { return finishReason; },
     parseLine(line) {
@@ -3057,6 +3334,16 @@ function createResponsesSseTranslator(model, responseId, created) {
 
         case 'error': {
           this.upstreamError = mapCcEventError(event);
+          // 上游在 HTTP 200 之后于**流内**报错时，这里以前只赋值不打日志：客户端收到 400，
+          // 而 journalctl 里一片安静（本次排障就是靠 nginx 的 body_bytes_sent=0 反推的）。
+          // 对齐 /v1/chat/completions 路径的 CC stream error。
+          log('warn', 'CC stream error', {
+            path: '/v1/responses',
+            message: event.error?.message || event.message || 'Unknown error',
+            upstreamStatus: this.upstreamError.reportedStatus,
+            code: this.upstreamError.code,
+            mappedTo: this.upstreamError.status,
+          });
           break;
         }
 
@@ -3202,6 +3489,24 @@ async function handleResponses(req, res) {
         await waitDrain(res);
       };
 
+      // 上游已 200：立刻把响应头 + response.created / response.in_progress 推下去。
+      // 不能等首个内容事件 —— Codex 实测 reasoning_effort=max + 大 prompt，首字要 15s+，
+      // 这段时间此前**零字节出网**，于是 nginx access.log 全是 `499 0`（body_bytes_sent=0）、
+      // 中间 CDN（EdgeOne）按源站超时掐掉连接、客户端只能每 15 秒重试一次。
+      // created 是不带内容的协议首事件，先发符合 Responses 语义；上游随后失败会走 response.failed。
+      await writeEvents(translator.start());
+
+      // SSE 保活：对齐 /v1/messages 的心跳思路，但这里发**注释行**。
+      // Responses 协议没有 ping 事件，塞未知 event 类型有被严格解析器判错的风险；
+      // 注释行（以 ':' 开头）按 SSE 规范必须被忽略 —— chat 端点在静默事件时也是这么发的。
+      // 为什么必须发：首字前的静默期实测 15~40s，中间层的"源站空闲"超时（EdgeOne 实测约 15s）
+      // 会把连接掐掉 —— 现象是客户端 ~16s 断连、代理侧 Client disconnected、nginx 只记到很少字节。
+      const heartbeat = setInterval(() => {
+        // 回调是同步的，无法 await waitDrain，所以用 writableNeedDrain 直接跳过（背压时少一条注释无副作用）
+        if (aborted || !started || res.writableEnded || res.writableNeedDrain) return;
+        try { res.write(': keepalive\n\n'); } catch (e2) {}
+      }, 5000);
+
       try {
         while (true) {
           const result = await Promise.race([reader.read(), idle.arm()]);
@@ -3253,7 +3558,7 @@ async function handleResponses(req, res) {
         }
       } catch (e) {
         if (aborted) {
-          try { reader.cancel(); } catch (e2) {}
+          try { reader.cancel().catch(() => {}); } catch (e2) {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             path: '/v1/responses', model, streaming: true, timeoutMs: STREAM_IDLE_TIMEOUT_MS,
@@ -3280,6 +3585,7 @@ async function handleResponses(req, res) {
           }
         }
       } finally {
+        clearInterval(heartbeat);
         idle.dispose();
       }
 
@@ -3498,6 +3804,9 @@ process.on('unhandledRejection', (reason) => {
   if (reason?.name === 'AbortError' || reason?.code === 'ABORT_ERR') {
     // 客户端断连触发的 abort — 预期行为，静默处理
     log('info', 'Aborted request cleaned up');
+  } else if (isRetryableUpstreamError(reason)) {
+    // 上游传输层闪断造成的异步 rejection（如 socket terminated），已被重试机制或上层吸收
+    log('info', 'Upstream socket terminated asynchronously (handled)');
   } else {
     log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
   }
@@ -3535,7 +3844,10 @@ server.listen(CFG.port, CFG.host, () => {
     keepAliveTimeout: `${KEEPALIVE_TIMEOUT_MS}ms (反代侧 keepalive_timeout 必须小于它)`,
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
-    upstreamProxy: UPSTREAM_PROXY || '(direct)',
+    upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
+    upstreamRetry: UPSTREAM_RETRY_MAX > 0
+      ? `${UPSTREAM_RETRY_MAX} retries, base ${UPSTREAM_RETRY_BASE_MS}ms (only before first byte)`
+      : 'disabled (CC_UPSTREAM_RETRY_MAX=0)',
     fingerprint: `derived from API key (salt: ${CFG.fingerprintSalt ? 'set' : 'unset'})`,
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {

@@ -4,9 +4,9 @@
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
 
-逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）—— 详见 `PROTOCOL-FACTS-1.53.1.md`：
+逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -39,7 +39,7 @@ commandcode/
 ├── .dockerignore         # 构建上下文排除规则
 ├── .github/
 │   └── workflows/
-│       └── docker-publish.yml  # 打 v* tag 时自动发布 GHCR 多架构镜像
+│       └── docker-publish.yml  # release 分支 / v* tag → GHCR 多架构（latest + release）
 ├── captured-requests/    # CLI 抓包数据（协议逆向参考）
 ├── README.md             # 英文文档
 └── README_zh.md          # 本文档（中文）
@@ -61,26 +61,38 @@ commandcode/
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
+| `cliMode` | `agent` | 信封 `mode`。上游枚举：`agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `cliSessionMode` | `interactive` | lifecycle 元数据里的 `mode`（**另一个枚举**：`interactive` / `non-interactive`）|
+| `fingerprintSalt` | `""` | 设备指纹的盐。**成批换设备身份**就用它（同一个 key 永远报同一台设备）|
+| `deviceProjectDir` | `""` | 伪装的项目目录（空则用内置 `C:\Users\dev\projects\app`）；改了 = 所有账号换一台设备 |
+| `emptySystemPlaceholder` | `true` | 无 system prompt 时发空格占位，阻止上游注入约 7.5K token 默认提示词（[#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)）|
 
 ### 环境变量
 
-| 变量 | 对应 config 字段 |
-|------|-----------------|
-| `PORT` | `port` |
-| `HOST` | `host` |
-| `CC_API_BASE` | `apiBase` |
-| `PROJECT_SLUG` | `projectSlug` |
-| `LOG_FILE` | `logFile` |
-| `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
-| `CC_STREAM_IDLE_MS` | 流式上游读空闲超时（默认 `30000`）|
-| `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
-| `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
-| `CMD_ZDR` | `zdr`（`1` 开启） |
-| `CC_UPSTREAM_PROXY` | `upstreamProxy` |
-| `CC_FINGERPRINT_SALT` | `fingerprintSalt`（成批更换设备身份） |
-| `CC_DEVICE_PROJECT_DIR` | `deviceProjectDir`（伪造的项目目录，与 `x-project-slug` 同源） |
-| `CC_CLI_MODE` | `cliMode`（信封 `mode`） |
-| `CC_CLI_SESSION_MODE` | `cliSessionMode`（lifecycle metadata 的 `mode`，另一个枚举） |
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `PORT` | `3000`（自带 config.json 为 `3050`）| 监听端口 → `port` |
+| `HOST` | `0.0.0.0` | 监听地址 → `host` |
+| `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
+| `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
+| `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
+| `LOG_FILE` | 空 | 日志文件 → `logFile`（**同步写**，见[其它注意事项](#其它注意事项)）|
+| `CC_USE_PROVIDER_MODELS` | `true` | 动态拉取模型列表 → `useProviderModels` |
+| `CMD_ZDR` | 关 | `1` 开启 ZDR-only 路由 → `zdr` |
+| `CC_CLI_MODE` | `agent` | 信封 `mode` → `cliMode` |
+| `CC_CLI_SESSION_MODE` | `interactive` | lifecycle 元数据的 `mode` → `cliSessionMode` |
+| `CC_FINGERPRINT_SALT` | 空 | 设备指纹盐 → `fingerprintSalt` |
+| `CC_DEVICE_PROJECT_DIR` | 空 | 伪装的项目目录 → `deviceProjectDir` |
+| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位；`false` 关掉 → `emptySystemPlaceholder` |
+| `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
+| `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
+| `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | 上游「未吐字前闪断」的内部重试次数；`0` = 关闭，见[上游闪断重试](#上游闪断重试) |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 重试退避基数（毫秒），实际退避 = base × 尝试序号 |
+| `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
+| `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -124,6 +136,24 @@ CC_DEVICE_PROJECT_DIR='C:\\Users\\you\\projects\\app' npm start   # 可选：改
 > `timezone` 是**客户端本机操作系统的时区**（`Intl.DateTimeFormat().resolvedOptions().timeZone`），**不是出口 IP 的时区**。所以**不要**把它绑定到出口 IP：中国大陆用户通过代理访问本服务时，本机时区与流量出口地不一致是**常态而非异常**。
 >
 > 真正有意义的性质是**它在你自身用户群里的分布**，而不是与 IP 是否一致。如果你的用户集中在一个地区，却从 15 个全球时区里均匀取，就会让每个账号看起来来自不同的大洲。应当让池子匹配实际使用这个部署的人群 —— 这是运维决策：单一地区用户群应当收窄（或加权）`FINGERPRINT_TZS`，而不是全球随机。
+### 工具截图预算
+
+工具结果里的图片会**单独**作为 `image` 块发给上游（`function_call_output.output` 里的 `input_image`
+不再被 `JSON.stringify` 进 tool-result 文本）。原因是 base64 一旦被上游按**文本**分词就极其昂贵 ——
+真机实测 Codex Desktop 单张 2.76MB 截图 ≈ **1.92M token**，直接撞穿模型的 1M 窗口：
+
+```
+400 This model's maximum context length is 1048576 tokens. However, you requested
+    1986800 tokens (1922800 in the messages, 64000 in the completion)
+```
+
+但图片仍会随每一轮请求**全量重传**：真机实测一个会话里 11 张截图 ≈5.5MB base64，配合上面的内存放大
+×5.1~7.4，在 1GB 的机器上足以把代理顶到 `anon-rss 532MB` 并触发 **global OOM**（内核杀掉 node，
+整机假死）。`CC_MAX_TOOL_IMAGE_MB`（默认 `6`）按**从新到旧**保留到预算之内（至少保一张），被裁掉的
+替换成 `[older tool screenshot omitted: image budget exceeded]` —— 模型知道有图被丢，不会以为历史里
+本来就没图。只作用于工具截图，用户自己贴的图不受影响。
+
+> 想让模型看到全部截图就调大预算，但请按 `预算 × 并发 × 5~7` 估内存（并发见[在途上限](#在途请求上限可选)）。
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
@@ -140,8 +170,9 @@ CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 - 作用于 `/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events` 与 `/provider/v1/models`。
 - **不影响**本地监听、`/health` 与 npm 版本检查。
 - 仅支持 `http://`（CONNECT）代理。实现方式是自建 CONNECT 隧道 + `node:https` 复用同一 socket，**不新增任何依赖**，Node 18+ 即可用。
-- 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按 `api.commandcode.ai` 校验，绝不针对代理降级。
+- 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按**目标主机名**校验，绝不针对代理降级。
 - **指纹/lifecycle 预请求也走代理**是刻意的：若它们直连而上游生成走代理，同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
+- 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
 
@@ -307,6 +338,24 @@ data: {"type":"message_stop"}
 }
 ```
 
+### `POST /v1/responses`
+
+OpenAI **Responses API**（Codex、以及新版 OpenAI SDK 用的那套）。
+
+请求侧做转译：`input`（消息数组，item 可省略 `type`）、`instructions`、`max_output_tokens`、`temperature`、`top_p`、`reasoning`、`tools`、`tool_choice` 都会映射进 CC 信封；响应按 Responses 形状返回（`object: "response"`、`output` 数组、`usage`、`status`）。流式为 SSE：
+`response.created` / `response.in_progress` / `response.output_item.added|done` / `response.content_part.added|done` / `response.output_text.delta|done` / `response.reasoning_summary_text.delta|done` / `response.function_call_arguments.delta|done`，收尾是 `response.completed`（被 `max_output_tokens` 截断时为 `response.incomplete`，出错为 `response.failed`）。
+
+- **无状态**：`previous_response_id` 不支持，传了直接 `400` —— 每轮把完整 `input` 发过来即可（代理不存会话历史）。
+- 错误体是 Responses 风格：`{"error":{"message":...,"type":...}}`。
+- 与 `/v1/chat/completions` 共用同一套上游调用、缓存断点与空闲看门狗。
+- **首字静默与保活**：拿到上游 `200` 后**立刻**下发 `response.created` / `response.in_progress`，此后等待期间每 5s 发一条 SSE 注释行 `: keepalive`。reasoning 模型 + 大 prompt 的首字实测 15~40s，这段静默期此前**零字节出网**，会被中间层（实测 EdgeOne 源站空闲超时约 15s）或客户端首字节超时掐断 —— 现象是 nginx 侧 `499`、`body_bytes_sent=0`、客户端每 15 秒重试一次。注释行按 SSE 规范必须被客户端忽略（`/v1/messages` 用的是 `event: ping`，Responses 没有 ping 事件，塞未知 event 类型有被严格解析器判错的风险）。
+
+```bash
+curl http://127.0.0.1:3050/v1/responses \
+  -H "Authorization: Bearer user_xxxxxxxxx" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
+```
+
 ### `GET /v1/models`
 
 返回可用模型列表。优先从 Provider API 动态拉取（5min 缓存），失败回退硬编码列表。
@@ -317,12 +366,29 @@ data: {"type":"message_stop"}
 
 ## 错误码
 
-| HTTP 状态 | 说明 |
-|-----------|------|
-| 400 | 请求格式错误 |
-| 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入） |
-| 429 | 零输出 token，或流空闲超时（30s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
-| 502 | CC 上游错误 |
+代理自己产生的：
+
+| HTTP | 场景 |
+|------|------|
+| `400` | 请求体不是合法 JSON、`input` 为空、用了不支持的 `previous_response_id` |
+| `401` | 缺 API Key / 格式不对（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入）|
+| `404` | 路径不存在 |
+| `413` | 请求体超过 `CC_MAX_BODY_MB`（连接保持可排空，不会直接 reset）|
+| `429` | 零输出 token、流空闲超时（30s 流式 / 90s 非流式）、或上游限流映射 —— 都带 `Retry-After`，SDK 自动退避重试；连续 3 次超时后提示压缩上下文 |
+| `502` | CC 上游错误（`fetch failed` 这类连接层失败也走这里）|
+| `503` | 开了 `CC_MAX_INFLIGHT` 且超过在途上限（`type: server_busy`）|
+
+上游 CC 状态码的映射（`CC_STATUS_MAP`，未列出的按 `502 upstream_error`）：
+
+| 上游 | 下游 |
+|------|------|
+| `400` → `400 invalid_request_error` | `401` → `401 authentication_error` |
+| `402` → `429 rate_limit_error`（付费失败按限流处理）| `403` → `401 authentication_error` |
+| `404` → `404 not_found` | `422` → `400 invalid_request_error` |
+| `429` → `429 rate_limit_error`（带 `retry_after: 30`）| `500` / `502` → `502 upstream_error` |
+| `503` → `503 temporarily_unavailable` | 其它 → `502 upstream_error` |
+
+上游错误体里的机器可读分类（`error.code`，如 `BAD_REQUEST` / `USAGE_EXCEEDED`）会透传到下游错误体的 `error.code`。
 
 ## 模型列表
 
@@ -424,7 +490,8 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli` |
-| **Project Slug** | `x-project-slug` = `slugify(process.cwd())`，与 `config.workingDir` 同源 |
+| **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)`，与 `config.workingDir` 同源（默认 `C:\Users\dev\projects\app`，用 `CC_DEVICE_PROJECT_DIR` 改）|
+| **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 既不会自相矛盾（"指纹说 win32、环境说 linux"），也不把宿主真实平台、Node 版本、cwd 交给上游 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
@@ -442,7 +509,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
   "config": {
     "workingDir": "C:\\project",
     "date": "2026-06-07",
-    "environment": "win32-x64, Node.js v24.16.0",
+    "environment": "win32",
     "structure": [],
     "isGitRepo": false,
     "currentBranch": "",
@@ -452,7 +519,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
   },
   "memory": null,
   "taste": null,
-  "skills": "",
+  "skills": null,
   "permissionMode": "standard",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
@@ -464,7 +531,9 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 }
 ```
 
-条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`、`tools`（映射为 CC `input_schema` 格式）。
+`config.environment` / `config.workingDir` 都取自 `DEVICE_PROFILE`（不是宿主真实值），`skills` 发 `null`（不是空串）。
+
+条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`、`tools`（映射为 CC `input_schema` 格式）、`tool_choice`、`parallel_tool_calls`。给了 `prompt_cache_key`（或客户端自带 `cache_control` 断点）时，断点会落在 system 的最后一块上 —— 缓存按前缀计，system 正是最前那段前缀。
 
 ### CC API 图片消息格式
 
@@ -486,14 +555,19 @@ CLI 发送图片的格式：
 
 ### 从 GHCR 拉取
 
-每次打 `v*` tag 时 GitHub Actions 会自动构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
+GitHub Actions 会把多架构镜像（`linux/amd64` + `linux/arm64`）推到 GitHub Container Registry：
+
+| 标签 | 来源 | 说明 |
+|------|------|------|
+| `:release` | `release` 分支 | 跟随发布分支 |
+| `:latest` | `release` 分支 或 `v*` tag | 与 `:release` 同一个 digest。**"只在打 tag 时更新"是已修掉的旧行为** —— 它曾让用 `:latest` 的人长期停在旧版本、新端点表现为 404（[#28](https://github.com/MAXeaglet/commandcode-proxy/issues/28)）|
 
 ```bash
-docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+docker pull ghcr.io/maxeaglet/commandcode-proxy:release
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:release
 ```
 
-每次发版都会更新 `latest` 标签。镜像为公共可见，拉取无需登录。
+镜像为公共可见，拉取无需登录。升级后请确认 digest 真的变了（`docker inspect --format '{{index .RepoDigests 0}}'`），别假设本地缓存就是新版本。
 
 ### 快速启动 (docker compose)
 
@@ -522,20 +596,12 @@ npm run docker:build:multi
 
 ### 环境变量
 
+容器相关的只有两个，其余全部见上面的[环境变量](#环境变量)总表：
+
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
-| `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
-| `CC_UPSTREAM_PROXY` | 空 | 仅作用于 CC 上游请求的 `http://host:port` CONNECT 代理 |
-| `CC_FINGERPRINT_SALT` | 空 | 指纹派生用的盐；成批更换所有 key 的设备身份 |
-| `CC_DEVICE_PROJECT_DIR` | 空 | 伪造的项目目录；留空用内置 `C:\Users\dev\projects\app` |
-| `CC_CLI_MODE` | `agent` | 信封 `mode`：`agent\|learning\|custom-agent\|…` |
-| `CC_CLI_SESSION_MODE` | `interactive` | lifecycle 的 `mode`：`interactive\|non-interactive` |
-| `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
-| `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
-| `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
-| `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限返回 `503` + `Retry-After`，见[在途上限](#在途请求上限可选) |
 
 ## 在途请求上限（可选）
 
@@ -581,6 +647,45 @@ CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
 
 > ⚠️ 误杀的成本不止一次失败：被 abort 后返回 `429 + retry_after`，SDK 会自动重试，
 > 而重试等于**完整重发整个上下文**，长会话下每次误杀都要重付一次全量 prefill。
+
+## 上游闪断重试
+
+CC 上游在高峰期会中途掐断连接（对端 RST/FIN），undici 抛 `TypeError: terminated`；改动前这类闪断会原样回给下游
+`502 {"error":{"message":"Upstream error: terminated","type":"proxy_error"}}`。
+
+只要**此刻尚未向下游写出任何字节**，这个请求对下游而言从未开始过 —— 代理内部重试即可消化掉抖动，
+下游（CPA / 客户端）不必先吃一个 502 再自己重试（那等于完整重发整个上下文）。
+
+- **重试条件（需同时满足）**：① 上游没走完 —— 传输层闪断（`terminated` / `ECONNRESET` / `ECONNREFUSED` /
+  `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` / `fetch failed`），
+  或对端**干净收尾但整条流里没有 finish 事件**（FIN 截断，与 RST 同类）；
+  ② 尚未向下游写出任何字节（流式看是否已写出 header / 事件，非流式看 `headersSent`）；
+  ③ 客户端没断连；④ 未达重试上限。
+- 一旦已经向下游写过头或事件，**绝不重试**：语义已提交，重试只会让下游看到重复文本。
+- `STREAM_IDLE_TIMEOUT`（`429`「请减少上下文」）是刻意传给下游的信号，**不重试**。
+- 已解析到上游 `error` 事件（`429` / `503` 等）时**不重试**：连接随后再断，也优先把这条语义错误透出，
+  而不是用传输层错误覆盖成 `502`（把「上游容量不足」说成「代理挂了」是误导）。
+- 退避期间客户端断连 → 放弃重试（下游已经走了，再打一次上游只是白烧额度）。
+- 重试对下游完全透明：下游只看到一次 200（内容来自重试成功的那一次）。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | 最大重试次数（共 3 次尝试）；`0` = 关闭本行为 |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 退避基数（毫秒），实际退避 = base × 尝试序号 |
+
+日志里可复盘：`Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying`（发生了一次重试，`attempt` / `maxAttempts` / `cause`
+或 `reason` 都在结构体里）、`Upstream retry recovered`（重试后**确实**交付了正常响应）、
+`Upstream retry abandoned (client disconnected during backoff)`（退避期间客户端走了，放弃重试）；
+启动横幅的 `upstreamRetry` 字段可直接确认生效值。
+
+```bash
+CC_UPSTREAM_RETRY_MAX=0 npm start        # 关闭重试，行为退回改动前
+CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # 退避拉长（默认 400ms）
+```
+
+> **覆盖范围**：目前 `/v1/chat/completions` 的流式与非流式两条路径都接了重试循环；
+> `/v1/messages` 与 `/v1/responses` 结构不同，未在本次改动中覆盖（闪断仍按原样报错）。
 
 ## 内存与部署
 
@@ -640,6 +745,11 @@ location /v1/ {
     proxy_read_timeout 300s;   # 需大于 30s 的流空闲超时
 }
 ```
+
+> ⚠️ **keep-alive 时序**：上面 `proxy_set_header Connection ""` 让 nginx 与后端保持长连接，此时反代侧的
+> `upstream { keepalive_timeout ...; }` 必须**小于**后端的 `CC_KEEPALIVE_TIMEOUT_MS`（默认 65s）。反了的话，
+> 反代会复用一条后端已经 FIN 掉的连接去写 POST 请求体，吃 `EPIPE`（nginx 日志里是 `sendfile() failed (32: Broken pipe)`）；
+> 而 POST 非幂等、nginx 默认不重试 —— 客户端直接拿到 502。
 
 ### 僵死连接（既不读也不断开）
 
