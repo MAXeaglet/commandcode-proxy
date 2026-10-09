@@ -752,9 +752,12 @@ function buildCcRequest(openaiReq) {
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
   if (tool_choice !== undefined) {
-    // OpenAI 格式 → CC (Anthropic 风格) 格式
-    if (typeof tool_choice === 'string') {
-      const map = { 'auto': 'auto', 'none': 'none', 'required': 'any' };
+    if (tool_choice === 'none' || (typeof tool_choice === 'object' && tool_choice?.type === 'none')) {
+      // none 表示本轮禁用工具：CC 上游 tool_choice 枚举只有 auto / any / tool，
+      // 传 none 会被 CC 以 400 拒绝。语义上清空 tools 且不下发 tool_choice。
+      body.params.tools = [];
+    } else if (typeof tool_choice === 'string') {
+      const map = { 'auto': 'auto', 'required': 'any' };
       body.params.tool_choice = { type: map[tool_choice] || 'auto' };
     } else if (tool_choice.type === 'function') {
       // OpenAI object → Anthropic object
@@ -3538,7 +3541,9 @@ async function handleResponses(req, res) {
   };
   const ccBody = buildCcRequest(chatReq);
   const promptCacheKey = chatReq.prompt_cache_key;
+  // respReq 是 Codex/客户端送来的完整会话，比 chatReq 还大一份，及时释放避免内存驻留
   chatReq = null;
+  respReq = null;
 
   const abortController = new AbortController();
   let aborted = false;
