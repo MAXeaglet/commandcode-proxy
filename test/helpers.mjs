@@ -63,7 +63,10 @@ export async function startMockUpstream(opts = {}) {
     req.on('end', async () => {
       const raw = Buffer.concat(chunks).toString('utf8');
       seen.push({ url: req.url, method: req.method, headers: req.headers, raw });
-      if (opts.onRequest) await opts.onRequest(req, res, seen[seen.length - 1]);
+      // onRequest 返回 true 表示它自己接管了响应（可以只写一半就挂住，
+      // 用来模拟"上游有数据但长时间没有新数据"，触发代理的空闲超时）。
+      const handled = opts.onRequest ? await opts.onRequest(req, res, seen[seen.length - 1]) : false;
+      if (handled === true) return;
       if (res.writableEnded) return;
       const status = opts.status ?? 200;
       if (status !== 200) {

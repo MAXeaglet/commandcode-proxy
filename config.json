@@ -7,5 +7,9 @@
   "logFile": "",
   "logLevel": "info",
   "zdr": false,
-  "upstreamProxy": ""
+  "upstreamProxy": "",
+  "fingerprintSalt": "",
+  "deviceProjectDir": "",
+  "cliMode": "agent",
+  "cliSessionMode": "interactive"
 }
