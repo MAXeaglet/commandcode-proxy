@@ -363,8 +363,6 @@ function deriveSessionId(apiKey, ccBody) {
       if (b && typeof b.text === 'string') h.update(b.text).update('\0');
     }
   }
-    }
-  }
   for (const msg of params.messages || []) {
     if (msg.role !== 'user') break; // assistant / tool 起始后的输入不参与派生
     if (!Array.isArray(msg.content)) continue;
