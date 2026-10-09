@@ -79,6 +79,42 @@ test('fork: 无 session 头时回落 per-key session，threadId 仍与之同值'
   } finally { await s.close(); }
 });
 
+test('fork: PR #29 兜底 session_id 由请求内容前缀派生（多轮一致，新会话独立）', async () => {
+  const s = await setup();
+  try {
+    // 会话 A 第 1 轮
+    const r1 = await s.proxy.post('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'hello' }],
+    }, AUTH);
+    await r1.text();
+    const sidA1 = s.mock.lastGenerate().headers['x-session-id'];
+    assert.match(sidA1, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+    // 会话 A 第 2 轮（前缀一致，后续追加 assistant 与新提问）
+    const r2 = await s.proxy.post('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi there' },
+        { role: 'user', content: 'how are you?' },
+      ],
+    }, AUTH);
+    await r2.text();
+    const sidA2 = s.mock.lastGenerate().headers['x-session-id'];
+    assert.equal(sidA2, sidA1, '同一多轮对话即便无 session 头也必须派生出相同的 session_id 保证缓存');
+
+    // 会话 B（首条提问不同）
+    const r3 = await s.proxy.post('/v1/chat/completions', {
+      model: 'm', stream: true,
+      messages: [{ role: 'user', content: 'different topic' }],
+    }, AUTH);
+    await r3.text();
+    const sidB = s.mock.lastGenerate().headers['x-session-id'];
+    assert.notEqual(sidB, sidA1, '不同对话必须派生出不同的 session_id 避免缓存踩踏');
+  } finally { await s.close(); }
+});
+
 // ── issue #18：上游 HTTP(S) 代理（零依赖 CONNECT 隧道）──
 // Bun 的 node:http 基于 fetch 实现：CONNECT 方法发起即报 "fetch() URL is invalid"，
 // 且 http.request 的 createConnection 会被忽略（自建连接直连），隧道无法落地。
