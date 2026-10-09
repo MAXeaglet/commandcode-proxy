@@ -817,6 +817,9 @@ function createSseTranslator(model, completionId, created) {
   let chunkIndex = 0;
   let sentRole = false;
   let finishReason = null;
+  let unsupportedFinishReason = null;
+  // 只承载「上游连接失败族」的 finishReason（见 toOpenAIFinishReason 的说明）：
+  // 不认识的结束原因折成 stop 正常收尾，不再进这里。
   let usage = null;
   let toolCallIndex = 0;
 
@@ -907,7 +910,17 @@ function createSseTranslator(model, completionId, created) {
             total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
             prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
           } : undefined;
-          out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
+          if (OPENAI_FINISH_REASONS.has(fr)) {
+            out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
+          } else {
+            // 走到这里只剩「上游连接失败族」（upstream_error；CC 在 provider 返回空
+            // 响应时发的裸 'error' 已在 mapFinishReason 里并入它）。原样写进 SSE 会让
+            // 严格客户端把整条流判成反序列化失败（GrokZen：unknown variant `error`），
+            // 且丢失「可重试」信号。交回流尾 incompleteDetail()，按可重试错误上报。
+            // 不认识的结束原因（实测 'other'）不在这里 —— toOpenAIFinishReason 已把它
+            // 折成 stop，因为它表示「这一轮结束了」，不是「没完成」。
+            unsupportedFinishReason = fr;
+          }
           break;
         }
 
@@ -942,7 +955,15 @@ function createSseTranslator(model, completionId, created) {
 
     /** 这次上游流若没有正常走完 finish，返回可读原因；正常则为 null。 */
     incompleteDetail() {
-      return incompleteUpstreamDetail(sawFinish, finishReason);
+      const standard = incompleteUpstreamDetail(sawFinish, finishReason);
+      if (standard) return standard;
+      if (!unsupportedFinishReason) return null;
+      // 到这里只剩上游连接失败族（'upstream_error'），措辞与 network/connection-error
+      // 一致。末句保留作防御：不认识的结束原因已由 toOpenAIFinishReason 折成 stop，
+      // 不再走这条路径。
+      return unsupportedFinishReason === 'upstream_error'
+        ? 'provider reported an upstream connection failure'
+        : `provider reported an unsupported finish reason (${unsupportedFinishReason})`;
     },
 
     /** 获取 SSE 结束标记 */
@@ -998,18 +1019,24 @@ function anthropicInputTokens(usage, noCacheOverride) {
 //   tool_use | tool-calls | tool_calls                    → tool_calls
 //   length | max_tokens | max_output_tokens
 //          | model_context_window_exceeded                → length
-//   /^(network|connection|upstream)[-_\s]?error$/i        → upstream_error
+//   error | /^(network|connection|upstream)[-_\s]?error$/i → upstream_error
 //   pause_turn                                            → pause_turn（原样保留）
 // 关键点：'length' 家族**不止 'length' 一个值**。max_output_tokens 与
 // model_context_window_exceeded 都是「输出被截断」，折成 stop/end_turn 等于
 // 把半截回答谎报成完整回答。未知值一律原样返回，宁可让它露出来也不要静默折成 stop。
+// 这里只是**内部**词汇表：露出来的值到出口会由 toOpenAIFinishReason 处理（连接失败族
+// 保原值走可重试 502，其余折成 stop），不会以非法 finish_reason 透给客户端。
+//
+// 例外：裸 'error' 必须并进 upstream_error。Command Code 在 provider 返回空响应时
+// 发 `finish` + `finishReason:"error"`；它不是可透出的业务值，原样返回会变成非法的
+// OpenAI finish_reason（严格客户端整条流反序列化失败），也会丢掉可重试语义。
 function mapFinishReason(reason) {
   const r = String(reason ?? '').trim().toLowerCase();
   if (!r) return 'stop';
   if (r === 'tool-calls' || r === 'tool_calls' || r === 'tool_use') return 'tool_calls';
   if (r === 'length' || r === 'max_tokens'
       || r === 'max_output_tokens' || r === 'model_context_window_exceeded') return 'length';
-  if (/^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
+  if (r === 'error' || /^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
   return r;
 }
 
@@ -1974,8 +2001,29 @@ function mapAnthropicStopReason(finishReason) {
 // OpenAI 的 finish_reason 只有 stop | length | tool_calls | content_filter | function_call。
 // pause_turn 没有对应值：折成 'stop' 是谎报完成（正是要修的问题），
 // 折成 'length' 至少如实表达了「输出不完整」，下游的截断处理会做对的事。
+const OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'content_filter', 'function_call']);
+
+// 内部规范化取值 → 可透出的 OpenAI finish_reason。必须**全函数**：任何非标准值
+// 原样写进 SSE / JSON body，严格客户端（GrokZen 的 FinishReason 是无兜底的枚举）
+// 会把整条流判成反序列化失败，丢的是已经流出去的回答。
+//
+// 三种未知值，两种待遇：
+//   · upstream_error —— 上游连接失败族，保留原值：流尾 incompleteDetail() /
+//     incompleteUpstreamDetail() 按可重试 502 上报（语义不动）。
+//   · 其余不认识的值（实测 'other'）—— 上游**确实发过** finish，只是原因不在标准
+//     词汇表里：AI SDK 把不认识的 finish_reason 归成 other，而「一个完成信号都没
+//     收到」在同一实现里归成 error，两者不是一回事。本代理另外两条协议面本来也
+//     就是这么判的（/v1/messages 的 mapAnthropicStopReason 默认 end_turn、
+//     /v1/responses 在 3152 行只拦 no finish / upstream_error，其余走
+//     response.completed），这里对齐成 stop；以前 chat 路径把它折成可重试 502 并
+//     写 response was truncated，既把「完成了但原因不认识」说成「没完成」，又白丢
+//     一轮回答（provider 若稳定返回 other 会重试到上限后整轮失败）。
 function toOpenAIFinishReason(finishReason) {
-  return finishReason === 'pause_turn' ? 'length' : finishReason;
+  if (finishReason === 'pause_turn') return 'length';
+  if (finishReason === 'upstream_error') return finishReason;
+  if (OPENAI_FINISH_REASONS.has(finishReason)) return finishReason;
+  log('warn', 'Unrecognized upstream finish reason', { reason: String(finishReason), mappedTo: 'stop' });
+  return 'stop';
 }
 
 // Generate a Claude-format fake signature for thinking blocks.
