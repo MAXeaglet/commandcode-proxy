@@ -783,18 +783,6 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 - **按内容派生的 session id**：客户端不带 session header 时，id 是 `apiKey + model + system + 首个非 user 消息之前的连续 user 文本` 的哈希 —— 这段前缀里任何变化（system 里带当天日期、中途换 model）都会让同一场对话中途换 id，进而导致缓存重建。需要精确控制时请由客户端下发 `x-session-id` 或 `prompt_cache_key`。
 - **多账号 + 多实例**：唯一的进程内状态只剩 `keyStateStore`（每 key 一份确定性指纹 + 初始化节流）。同一个 API key 打到两个实例，报告的设备指纹与 session id 都是**同一个** —— 前提是各实例的 `CC_FINGERPRINT_SALT` 与 `CC_DEVICE_PROJECT_DIR` 保持一致，否则指纹会分叉。只有 fingerprint/lifecycle 预请求的节流是各实例独立的，所以两个实例可能落在同一时间窗内各发一轮初始化。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
 
-## 贡献者 (Contributors)
-
-衷心感谢为本项目做出重要贡献的社区开发者：
-
-- [@jinyu2022](https://github.com/jinyu2022) — 基于请求内容派生 Session ID 解决 Prompt Cache 亲和性冲突 ([#29](https://github.com/MAXeaglet/commandcode-proxy/pull/29))、设备指纹增强 ([#35](https://github.com/MAXeaglet/commandcode-proxy/pull/35))、超大请求内存预检优化 ([#44](https://github.com/MAXeaglet/commandcode-proxy/pull/44))。
-- [@xelr233](https://github.com/xelr233) — 自动化端到端测试套件、上游闪断透明重试断连监听修复、流式零输出异常防护、上游代理支持。
-- [@Catapult291](https://github.com/Catapult291) — Responses 用户消息图片保留、finishReason 规范化处理、流内错误状态码映射文档。
-- [@renleihaokun](https://github.com/renleihaokun) — 并行工具调用带图时序排布修复。
-- [@Zhou-Ruichen](https://github.com/Zhou-Ruichen) — 跨请求 Prompt Cache affinity 保持。
-- [@zmhuanf](https://github.com/zmhuanf) — Developer role 映射兼容性修复。
-- [@ouones](https://github.com/ouones) — TDZ 断连监听变量提升与 x-api-key 支持。
-
 ## 免责声明
 
 本项目仅供**学习和研究**使用。

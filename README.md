@@ -789,18 +789,6 @@ A more robust cap still belongs at the reverse proxy (`limit_conn`), since only 
 - **Content-derived session id**: without a client-supplied session header the id hashes `apiKey + model + system + user text up to the first non-user message`, so anything that changes inside that prefix — a system prompt carrying today's date, a model switch — gives a different session id mid-conversation, which forces a cache rebuild. Send `x-session-id` or `prompt_cache_key` from the client when you need exact control.
 - **Multi-account + multiple instances**: the only per-process state left is `keyStateStore` (a deterministic fingerprint plus an init throttle per key). The same API key served by two instances therefore reports the **same** device fingerprint and the **same** session id — provided `CC_FINGERPRINT_SALT` and `CC_DEVICE_PROJECT_DIR` are identical on both, or the fingerprints diverge. Only the fingerprint/lifecycle pre-request timing is per-instance, so two instances may each send one init round inside the same window. When scaling out, use consistent hashing on the API key (`hash $cc_key consistent`) rather than round-robin.
 
-## Contributors
-
-Special thanks to all contributors who helped improve this project:
-
-- [@jinyu2022](https://github.com/jinyu2022) — Content-derived session ID derivation for prompt cache optimization ([#29](https://github.com/MAXeaglet/commandcode-proxy/pull/29)), fingerprint refinement ([#35](https://github.com/MAXeaglet/commandcode-proxy/pull/35)), memory optimizations ([#44](https://github.com/MAXeaglet/commandcode-proxy/pull/44)).
-- [@xelr233](https://github.com/xelr233) — End-to-end test suites, transient disconnect retry listener fixes, zero-output guard, upstream proxy support.
-- [@Catapult291](https://github.com/Catapult291) — Responses user image preservation, normalized finishReason handling, stream error status code mapping docs.
-- [@renleihaokun](https://github.com/renleihaokun) — Parallel tool call image batching order fixes.
-- [@Zhou-Ruichen](https://github.com/Zhou-Ruichen) — Prompt cache affinity preservation across requests.
-- [@zmhuanf](https://github.com/zmhuanf) — Developer role mapping fixes.
-- [@ouones](https://github.com/ouones) — TDZ disconnect handler variable hoist & x-api-key support.
-
 ## Disclaimer
 
 This project is for **educational and research purposes** only.
