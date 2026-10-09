@@ -114,9 +114,9 @@ The device fingerprint reported to `/alpha/fingerprint/record` is **derived dete
 |---|---|---|
 | Process restart | Map cleared → **new machine** | same machine |
 | Second instance | same key = **two machines** | same machine |
-| Session expiry (12h) | `keyStateStore.delete` → **new machine every 12h** | same machine |
+| Session expiry / key-state eviction | entry dropped → **new machine** | same machine (re-derived) |
 
-> The 12h case was the most visible: a real user does not replace their computer twice a day, and upstream's `device_fingerprints` table is keyed on `(userId, thumbmark)`.
+> Session expiry was the visible one: the store dropped a key's state every 12h, and a real user does not replace their computer twice a day. That store is gone — `x-session-id` is now derived from request content, so nothing expires. Key-state eviction remains (24h idle), but dropping the entry no longer rotates the fingerprint, because it is re-derived to the same value. Upstream's `device_fingerprints` table is still keyed on `(userId, thumbmark)`.
 
 **Why derived rather than "pick a device from a hash bucket"** — a fixed pool caps entropy at the pool size, so once the number of keys exceeds it, keys *must* share a fingerprint. With ~50 keys and a 1000-entry pool, ~2 keys collide; with a 100-entry pool, ~20 do. A shared `thumbmark` under two different `userId`s is direct evidence of multi-account-same-machine — exactly what you don't want to manufacture. Derivation keeps every key a distinct device (collision probability 2⁻²⁵⁶) while still being stable.
 
