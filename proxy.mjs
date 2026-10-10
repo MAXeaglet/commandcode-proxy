@@ -24,6 +24,7 @@ function loadConfig() {
     logFile: '',
     logLevel: 'info',
     useProviderModels: true,
+    useProviderModelsWithPlanFilter: false,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
     cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
@@ -2923,46 +2924,180 @@ async function handleMessages(req, res) {
 
 // ── 动态模型列表 ────────────────────────────────────
 
+function isPricingRow(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && typeof value.id === 'string'
+    && value.availability && typeof value.availability === 'object'
+    && !Array.isArray(value.availability);
+}
+
+function findPricingRows(value) {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const nested = findPricingRows(child);
+      if (nested.length) return nested;
+    }
+  } else if (value && typeof value === 'object') {
+    if (Array.isArray(value.rows)) {
+      const rows = value.rows.filter(isPricingRow);
+      if (rows.length === value.rows.length && rows.length) return rows;
+    }
+    for (const child of Object.values(value)) {
+      const nested = findPricingRows(child);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+
+function extractPricingRows(rsc) {
+  for (const line of rsc.split(/\r?\n/)) {
+    const separator = line.indexOf(':');
+    if (separator < 0) continue;
+    try {
+      const rows = findPricingRows(JSON.parse(line.slice(separator + 1)));
+      if (rows.length) return rows;
+    } catch { /* RSC also contains non-JSON control records. */ }
+  }
+  return [];
+}
+
+function filterModelsByPlan(models, planId, rows) {
+  if (!planId) return models;
+  const modelKey = id => String(id).split('/').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+  const keysFor = item => [item.id, item.name].filter(Boolean).map(modelKey);
+  const availability = new Map();
+  for (const row of rows.filter(isPricingRow)) {
+    for (const key of keysFor(row)) availability.set(key, row.availability);
+  }
+  return models.filter(model => !keysFor(model).some(key => availability.get(key)?.[planId] === false));
+}
+
 let dynamicModels = null;
 let modelsLastFetch = 0;
+const planFilterCache = new Map();
+const planFilterInFlight = new Map();
+let pricingRowsCache = null;
+let pricingRowsInFlight = null;
 
 async function fetchModels(apiKey) {
   const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
-  }
+  if (!dynamicModels || (now - modelsLastFetch) >= CFG.modelRefreshIntervalMs) {
+    try {
+      if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
-  try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+      const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'x-cli-environment': 'production',
+          'x-command-code-version': CC_VERSION,
+        },
+        signal: AbortSignal.timeout(10000),
+      });
 
-    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
+      if (response.ok) {
+        const data = await response.json();
+        if (Array.isArray(data.data)) {
+          dynamicModels = data.data.map(m => ({
+            id: m.id,
+            name: m.name || m.id,
+          }));
+          modelsLastFetch = now;
+          log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
+        }
       }
+      if (dynamicModels) return applyPlanFilter(dynamicModels, apiKey);
+      log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
+    } catch (e) {
+      log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
     }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
-  } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
   }
 
-  // Fallback to hardcoded MODELS
-  return MODELS;
+  return applyPlanFilter(dynamicModels || MODELS, apiKey);
+}
+
+async function fetchPlanId(apiKey) {
+  const subscription = await upstreamFetch(`${CFG.apiBase}/alpha/billing/subscriptions`, {
+    headers: { 'x-api-key': apiKey },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!subscription.ok) return null;
+  const subscriptionBody = await subscription.json();
+  const planId = subscriptionBody?.data?.planId;
+  return typeof planId === 'string' && planId ? planId : null;
+}
+
+async function fetchPricingRows() {
+  const now = Date.now();
+  if (pricingRowsCache && pricingRowsCache.expiresAt > now) return pricingRowsCache.data;
+  if (pricingRowsInFlight) return pricingRowsInFlight;
+
+  pricingRowsInFlight = upstreamFetch('https://commandcode.ai/docs/resources/pricing-limits', {
+    headers: { rsc: '1' },
+    signal: AbortSignal.timeout(10000),
+  })
+    .then(async pricing => {
+      if (!pricing.ok) return null;
+      const rows = extractPricingRows(await pricing.text());
+      if (!rows.length) {
+        log('warn', 'Pricing model rows not recognized, using unfiltered list');
+        return null;
+      }
+      return rows;
+    })
+    .catch(e => {
+      log('warn', 'Pricing model fetch failed, using unfiltered list', { error: e.message });
+      return null;
+    })
+    .then(data => {
+      const expiresAt = Date.now() + CFG.modelRefreshIntervalMs;
+      pricingRowsCache = { data, expiresAt };
+      const timer = setTimeout(() => {
+        if (pricingRowsCache?.expiresAt === expiresAt) pricingRowsCache = null;
+      }, CFG.modelRefreshIntervalMs);
+      timer.unref?.();
+      return data;
+    })
+    .finally(() => { pricingRowsInFlight = null; });
+  return pricingRowsInFlight;
+}
+
+async function applyPlanFilter(models, apiKey) {
+  if (!CFG.useProviderModelsWithPlanFilter || !apiKey) return models;
+  const now = Date.now();
+  const cached = planFilterCache.get(apiKey);
+  if (cached && cached.expiresAt > now) {
+    const rows = cached.data && await fetchPricingRows();
+    return cached.data && rows ? filterModelsByPlan(models, cached.data, rows) : models;
+  }
+
+  let pending = planFilterInFlight.get(apiKey);
+  if (!pending) {
+    pending = fetchPlanId(apiKey)
+      .catch(e => {
+        log('warn', 'Plan model filter failed, using unfiltered list', { error: e.message });
+        return null;
+      })
+      .then(data => {
+        const expiresAt = Date.now() + CFG.modelRefreshIntervalMs;
+        planFilterCache.set(apiKey, {
+          data,
+          expiresAt,
+        });
+        const timer = setTimeout(() => {
+          if (planFilterCache.get(apiKey)?.expiresAt === expiresAt) planFilterCache.delete(apiKey);
+        }, CFG.modelRefreshIntervalMs);
+        timer.unref?.();
+        return data;
+      })
+      .finally(() => planFilterInFlight.delete(apiKey));
+    planFilterInFlight.set(apiKey, pending);
+  }
+
+  const planId = await pending;
+  if (!planId) return models;
+  const rows = await fetchPricingRows();
+  return rows ? filterModelsByPlan(models, planId, rows) : models;
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
