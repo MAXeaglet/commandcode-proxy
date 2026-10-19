@@ -116,19 +116,28 @@ test('fork: PR #29 兜底 session_id 由请求内容前缀派生（多轮一致�
 });
 
 // ── issue #18：上游 HTTP(S) 代理（零依赖 CONNECT 隧道）──
-// Bun 的 node:http 基于 fetch 实现：CONNECT 方法发起即报 "fetch() URL is invalid"，
-// 且 http.request 的 createConnection 会被忽略（自建连接直连），隧道无法落地。
-// 所以两个「必须走隧道」的用例只在 Node 跑；「不走代理」的负向断言两个运行器都成立。
-const IS_BUN = !!process.versions.bun;
-const notOnBun = IS_BUN ? test.skip : test;
+// Node 下走手搓 CONNECT 隧道；Bun 的 node:http 不支持 CONNECT，代理改用 Bun 原生
+// fetch({ proxy })：https 目标同样是 CONNECT，但 http 目标（本测试的 loopback mock）
+// 按规范走 absolute-form 转发。录制代理两种都接，统一记入 hits。
 
-/** 录制型 CONNECT 代理：记录每次 CONNECT 的 target，并做裸字节转发。 */
+/** 录制型代理：记录每次经代理的请求（CONNECT target 或 absolute-form URL），并转发。 */
 async function startRecordingProxy() {
   const port = await allocPort();
-  const connects = [];
-  const server = http.createServer((req, res) => { res.writeHead(405); res.end(); });
+  const hits = [];
+  const server = http.createServer((req, res) => {
+    let target;
+    try { target = new URL(req.url); } catch { res.writeHead(405); res.end(); return; }
+    hits.push(req.url);
+    const up = http.request({ host: target.hostname, port: target.port || 80,
+      path: target.pathname + target.search, method: req.method, headers: req.headers }, (ur) => {
+      res.writeHead(ur.statusCode, ur.headers);
+      ur.pipe(res);
+    });
+    up.on('error', () => res.destroy());
+    req.pipe(up);
+  });
   server.on('connect', (req, clientSocket, head) => {
-    connects.push(req.url);
+    hits.push(req.url);
     const [h, p] = req.url.split(':');
     const up = net.connect(Number(p || 443), h, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -139,10 +148,10 @@ async function startRecordingProxy() {
     clientSocket.on('error', () => up.destroy());
   });
   await new Promise(r => server.listen(port, '127.0.0.1', r));
-  return { port, connects, close: () => new Promise(r => server.close(r)) };
+  return { port, hits, close: () => new Promise(r => server.close(r)) };
 }
 
-notOnBun('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', async () => {
+test('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经代理', async () => {
   const rec = await startRecordingProxy();
   const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port,
@@ -150,7 +159,7 @@ notOnBun('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', asyn
   try {
     const r = await proxy.post('/v1/chat/completions', CHAT, AUTH);
     await r.text();
-    assert.ok(rec.connects.length >= 1, '应建立 CONNECT 隧道，实际 ' + JSON.stringify(rec.connects));
+    assert.ok(rec.hits.length >= 1, '上游请求应经代理，实际 ' + JSON.stringify(rec.hits));
     // generate + fingerprint + lifecycle 三条都要走代理
     assert.equal(mock.generateCount(), 1, 'generate 应经隧道到达上游');
     assert.equal(mock.lastGenerate().headers['user-agent'], 'cli', '经代理时 UA 仍为 cli');
@@ -159,7 +168,7 @@ notOnBun('#18: 配置 CC_UPSTREAM_PROXY 后上游请求经 CONNECT 隧道', asyn
   }
 });
 
-notOnBun('#18: 预请求也走代理（避免同一账号从两个 IP 注册）', async () => {
+test('#18: 预请求也走代理（避免同一账号从两个 IP 注册）', async () => {
   const rec = await startRecordingProxy();
   const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port,
@@ -167,9 +176,9 @@ notOnBun('#18: 预请求也走代理（避免同一账号从两个 IP 注册）'
   try {
     const r = await proxy.post('/v1/chat/completions', CHAT, AUTH);
     await r.text();
-    // 三条预请求 + generate 共 3 次 CONNECT（generate/fingerprint/lifecycle）
-    assert.ok(rec.connects.length >= 3,
-      'fingerprint 与 lifecycle 也必须走代理，否则账号会从两个 IP 注册。实际 CONNECT 数: ' + rec.connects.length);
+    // 三条预请求 + generate 共 3 次经代理（generate/fingerprint/lifecycle）
+    assert.ok(rec.hits.length >= 3,
+      'fingerprint 与 lifecycle 也必须走代理，否则账号会从两个 IP 注册。实际代理请求数: ' + rec.hits.length);
   } finally {
     await proxy.kill(); await mock.close(); await rec.close();
   }
@@ -182,7 +191,7 @@ test('#18: 未配置代理时不建立任何 CONNECT', async () => {
   try {
     const r = await proxy.post('/v1/chat/completions', CHAT, AUTH);
     await r.text();
-    assert.equal(rec.connects.length, 0, '默认应直连，不经任何代理');
+    assert.equal(rec.hits.length, 0, '默认应直连，不经任何代理');
   } finally {
     await proxy.kill(); await mock.close(); await rec.close();
   }
@@ -194,10 +203,10 @@ test('#18: 探活端点不经过上游代理', async () => {
   const proxy = await startProxy({ upstreamPort: mock.port,
     env: { CC_UPSTREAM_PROXY: 'http://127.0.0.1:' + rec.port } });
   try {
-    const before = rec.connects.length;
+    const before = rec.hits.length;
     const r = await proxy.get('/health');
     assert.equal(r.status, 200);
-    assert.equal(rec.connects.length, before, '/health 是本地端点，不应触发上游 CONNECT');
+    assert.equal(rec.hits.length, before, '/health 是本地端点，不应触发上游 CONNECT');
   } finally {
     await proxy.kill(); await mock.close(); await rec.close();
   }

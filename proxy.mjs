@@ -24,6 +24,7 @@ function loadConfig() {
     logFile: '',
     logLevel: 'info',
     useProviderModels: true,
+    useProviderModelsWithPlanFilter: false,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
     cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
@@ -1476,9 +1477,16 @@ async function proxyFetch(urlStr, options = {}) {
   });
 }
 
+// Bun 的 node:http 基于 fetch 实现：CONNECT 方法直接报 "fetch() URL is invalid"，
+// 且 createConnection 被忽略，上面的手搓隧道在 Bun 下无法工作。
+// Bun 原生 fetch 支持 { proxy }（https 目标走 CONNECT，http 目标走 absolute-form 转发，
+// URL 中的 user:pass 会转成 Proxy-Authorization），直接用它。
+const IS_BUN = !!process.versions.bun;
+
 /** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
 function upstreamFetch(urlStr, options) {
-  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
+  if (!UPSTREAM_PROXY) return fetch(urlStr, options);
+  return IS_BUN ? fetch(urlStr, { ...options, proxy: UPSTREAM_PROXY }) : proxyFetch(urlStr, options);
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -2923,46 +2931,205 @@ async function handleMessages(req, res) {
 
 // ── 动态模型列表 ────────────────────────────────────
 
+function isPricingRow(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && typeof value.id === 'string'
+    && value.availability && typeof value.availability === 'object'
+    && !Array.isArray(value.availability);
+}
+
+function findPricingRows(value) {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const nested = findPricingRows(child);
+      if (nested.length) return nested;
+    }
+  } else if (value && typeof value === 'object') {
+    if (Array.isArray(value.rows)) {
+      const rows = value.rows.filter(isPricingRow);
+      if (rows.length === value.rows.length && rows.length) return rows;
+    }
+    for (const child of Object.values(value)) {
+      const nested = findPricingRows(child);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+
+function extractPricingRows(rsc) {
+  for (const line of rsc.split(/\r?\n/)) {
+    const separator = line.indexOf(':');
+    if (separator < 0) continue;
+    try {
+      const rows = findPricingRows(JSON.parse(line.slice(separator + 1)));
+      if (rows.length) return rows;
+    } catch { /* RSC also contains non-JSON control records. */ }
+  }
+  return [];
+}
+
+function filterModelsByPlan(models, planId, rows) {
+  if (!planId) return models;
+  const modelKey = id => String(id).split('/').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+  const keysFor = item => [item.id, item.name].filter(Boolean).map(modelKey);
+  const availability = new Map();
+  for (const row of rows.filter(isPricingRow)) {
+    for (const key of keysFor(row)) availability.set(key, row.availability);
+  }
+  return models.filter(model => !keysFor(model).some(key => availability.get(key)?.[planId] === false));
+}
+
 let dynamicModels = null;
 let modelsLastFetch = 0;
+// 套餐过滤所需的两份数据（订阅 planId、pricing 表）只缓存成功结果。
+// 刷新失败先重试；重试仍失败则降级用最后一次成功的结果（即使已过期），
+// 从没成功过才返回 null（调用方据此不过滤，输出全量）。失败本身不缓存，下次请求会再试。
+const planFilterCache = new Map();      // apiKey → { data: planId|null, expiresAt }
+const planFilterInFlight = new Map();
+const pricingRowsState = { cache: null, inFlight: null };
+const PLAN_FILTER_ATTEMPTS = 3;
+const PLAN_FILTER_RETRY_BASE_MS = 300;
+
+/** 不值得重试的失败（如 401/403、页面结构变了）：重试也只会得到同样结果。 */
+class NonRetryableError extends Error {}
+
+async function withRetry(load) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await load();
+    } catch (e) {
+      if (e instanceof NonRetryableError || attempt >= PLAN_FILTER_ATTEMPTS) throw e;
+      await sleep(PLAN_FILTER_RETRY_BASE_MS * 2 ** (attempt - 1));
+    }
+  }
+}
+
+/**
+ * 读缓存或刷新。entry 由 getEntry/setEntry 存取，并发刷新共用 inFlight。
+ * 返回 { data, ok }：ok=false 表示本次刷新失败且没有任何历史成功结果。
+ */
+async function cachedRefresh({ what, getEntry, setEntry, getInFlight, setInFlight, load }) {
+  const entry = getEntry();
+  if (entry && entry.expiresAt > Date.now()) return { data: entry.data, ok: true };
+  const pending = getInFlight();
+  if (pending) return pending;
+
+  const p = withRetry(load)
+    .then(data => {
+      setEntry({ data, expiresAt: Date.now() + CFG.modelRefreshIntervalMs });
+      return { data, ok: true };
+    })
+    .catch(e => {
+      const stale = getEntry();
+      if (stale) {
+        log('warn', `${what} refresh failed, using last known result`, { error: e.message });
+        return { data: stale.data, ok: true };
+      }
+      log('warn', `${what} refresh failed, using unfiltered list`, { error: e.message });
+      return { data: null, ok: false };
+    })
+    .finally(() => setInFlight(null));
+  setInFlight(p);
+  return p;
+}
+
+function httpStatusError(what, response) {
+  try { response.body?.cancel?.(); } catch {}
+  const msg = `${what} HTTP ${response.status}`;
+  // 4xx（除 408/429）是确定性失败，不重试
+  const s = response.status;
+  return s >= 400 && s < 500 && s !== 408 && s !== 429 ? new NonRetryableError(msg) : new Error(msg);
+}
+
+async function fetchPlanId(apiKey) {
+  const subscription = await upstreamFetch(`${CFG.apiBase}/alpha/billing/subscriptions`, {
+    headers: { 'x-api-key': apiKey },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!subscription.ok) throw httpStatusError('subscription', subscription);
+  const subscriptionBody = await subscription.json();
+  // 成功响应但没有 planId（如无订阅）是有效结果，照常缓存，不当失败处理
+  const planId = subscriptionBody?.data?.planId;
+  return typeof planId === 'string' && planId ? planId : null;
+}
+
+async function fetchPricingRowsOnce() {
+  const pricing = await upstreamFetch('https://commandcode.ai/docs/resources/pricing-limits', {
+    headers: { rsc: '1' },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!pricing.ok) throw httpStatusError('pricing', pricing);
+  const rows = extractPricingRows(await pricing.text());
+  if (!rows.length) throw new NonRetryableError('pricing model rows not recognized');
+  return rows;
+}
+
+function fetchPricingRows() {
+  return cachedRefresh({
+    what: 'Pricing model rows',
+    getEntry: () => pricingRowsState.cache,
+    setEntry: entry => { pricingRowsState.cache = entry; },
+    getInFlight: () => pricingRowsState.inFlight,
+    setInFlight: p => { pricingRowsState.inFlight = p; },
+    load: fetchPricingRowsOnce,
+  });
+}
+
+function fetchPlanIdCached(apiKey) {
+  return cachedRefresh({
+    what: 'Plan subscription',
+    getEntry: () => planFilterCache.get(apiKey),
+    setEntry: entry => planFilterCache.set(apiKey, entry),
+    getInFlight: () => planFilterInFlight.get(apiKey),
+    setInFlight: p => { if (p) planFilterInFlight.set(apiKey, p); else planFilterInFlight.delete(apiKey); },
+    load: () => fetchPlanId(apiKey),
+  });
+}
 
 async function fetchModels(apiKey) {
   const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
-  }
+  if (!dynamicModels || (now - modelsLastFetch) >= CFG.modelRefreshIntervalMs) {
+    try {
+      if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
-  try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+      const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'x-cli-environment': 'production',
+          'x-command-code-version': CC_VERSION,
+        },
+        signal: AbortSignal.timeout(10000),
+      });
 
-    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
+      if (response.ok) {
+        const data = await response.json();
+        if (Array.isArray(data.data)) {
+          dynamicModels = data.data.map(m => ({
+            id: m.id,
+            name: m.name || m.id,
+          }));
+          modelsLastFetch = now;
+          log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
+        }
       }
+      if (dynamicModels) return applyPlanFilter(dynamicModels, apiKey);
+      log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
+    } catch (e) {
+      log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
     }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
-  } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
   }
 
-  // Fallback to hardcoded MODELS
-  return MODELS;
+  return applyPlanFilter(dynamicModels || MODELS, apiKey);
+}
+
+async function applyPlanFilter(models, apiKey) {
+  if (!CFG.useProviderModelsWithPlanFilter || !apiKey) return models;
+  const plan = await fetchPlanIdCached(apiKey);
+  if (!plan.ok || !plan.data) return models;
+  const pricing = await fetchPricingRows();
+  if (!pricing.ok) return models;
+  return filterModelsByPlan(models, plan.data, pricing.data);
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
