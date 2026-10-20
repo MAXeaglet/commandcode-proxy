@@ -272,3 +272,96 @@ test('#47 tool_choice: { type: "none" }（Anthropic 格式）同样清空 tools 
 });
 
 
+
+test('chat：无 reasoning 的 assistant 历史回填非空占位符并保留 reasoning_effort', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, reasoning_effort: 'medium',
+      messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: '',
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: 'result' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const asst = params.messages.find(m => m.role === 'assistant');
+    assert.deepEqual(asst.content.map(p => p.type), ['reasoning', 'tool-call'],
+      '取消的轮次也要带 reasoning 在最前');
+    assert.ok(typeof asst.content[0].text === 'string' && asst.content[0].text.length > 0,
+      '占位符必须是非空串（空串会被严格上游当作缺失）');
+    assert.equal(params.reasoning_effort, 'medium',
+      '历史上回填好后当前轮的 reasoning_effort 不应再被扣下');
+  } finally { await s.close(); }
+});
+
+test('chat：reasoning_content 为空串时同样回填占位符', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', reasoning_content: '', content: 'answer' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const asst = params.messages.find(m => m.role === 'assistant');
+    assert.deepEqual(asst.content.map(p => p.type), ['reasoning', 'text']);
+    assert.ok(asst.content[0].text.length > 0, '空串 reasoning 必须被占位符替换');
+  } finally { await s.close(); }
+});
+
+test('chat：真实 reasoning_content 原样保留（不被占位符覆盖）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', reasoning_content: 'real thinking', content: 'answer' },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const asst = params.messages.find(m => m.role === 'assistant');
+    assert.equal(asst.content[0].text, 'real thinking');
+  } finally { await s.close(); }
+});
+
+test('chat：content 数组的 reasoning 块提升为 reasoning_content（不重复）', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/chat/completions', {
+      model: 'm', stream: true, messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: [
+          { type: 'reasoning', text: 'via parts' },
+          { type: 'text', text: 'answer' },
+        ] },
+        { role: 'user', content: 'next' },
+      ],
+    });
+    const asst = params.messages.find(m => m.role === 'assistant');
+    assert.deepEqual(asst.content.map(p => p.type), ['reasoning', 'text'],
+      'reasoning 块应恰好出现一次且在最前');
+    assert.equal(asst.content[0].text, 'via parts');
+  } finally { await s.close(); }
+});
+
+test('responses：function_call 无 reasoning item 时也回填占位符', async () => {
+  const s = await setup();
+  try {
+    const { params } = await wireMessages(s.proxy, s.mock, '/v1/responses', {
+      model: 'm', stream: true,
+      input: [
+        { type: 'message', role: 'user', content: 'q' },
+        { type: 'function_call', call_id: 'c1', name: 'f', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'c1', output: 'result' },
+        { type: 'message', role: 'user', content: 'next' },
+      ],
+    });
+    const asst = params.messages.find(m => m.role === 'assistant');
+    assert.ok(asst, '应有 assistant 消息');
+    assert.equal(asst.content[0].type, 'reasoning');
+    assert.ok(asst.content[0].text.length > 0);
+  } finally { await s.close(); }
+});

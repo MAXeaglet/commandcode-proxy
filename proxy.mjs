@@ -638,6 +638,9 @@ function getDateStr() {
  * @property {CcRequestParams} params
  */
 
+/** 历史 assistant 消息确实没有 reasoning 时的非空占位符（见 buildCcRequest 内注释）。 */
+const MISSING_REASONING_PLACEHOLDER = '[reasoning unavailable: previous turn was interrupted]';
+
 /**
  * @returns {CcRequestBody}
  */
@@ -668,6 +671,12 @@ function buildCcRequest(openaiReq) {
   }
   for (let i = 0; i < systemBlocks.length - 1; i++) systemBlocks[i].text += '\n';
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
+
+  // 缺少 reasoning 的 assistant 历史消息计数：用非空占位符回填以满足上游
+  // 「每条历史 assistant 消息都带 reasoning_content」的校验（严格上游会把空串
+  // 也当成缺失，见 9router#4805 的 Zen 案例）。占位符是诚实的标记文本、
+  // 绝不伪装成真实思考内容；仅在取消/部分响应等确实无 reasoning 的场景触发。
+  let missingReasoningCount = 0;
 
   // Build tool_call_id → tool_name reverse lookup
   // 名字原样透传（理由见 toWireToolName 删除处的注释）。
@@ -710,18 +719,39 @@ function buildCcRequest(openaiReq) {
       // 思考内容必须回传：CC 在 thinking 模式下校验 reasoning 是否随历史带回，
       // 丢弃会让上游直接拒绝。次序也必须与 CC CLI 的抓包格式一致 ——
       // [reasoning, text, tool-call]，reasoning 在最前。
-      if (msg.reasoning_content) {
-        parts.push({ type: 'reasoning', text: msg.reasoning_content });
+      // reasoning 的真实来源依次是：顶层 reasoning_content 字段、content 数组
+      // 里的 reasoning 块（text 或 reasoning 字段）。两者都缺失或为空白时
+      // （典型场景：客户端把该轮取消在 reasoning 产出之前——AI SDK 的
+      // openai-compatible 仅在 reasoning 非空时才下发 reasoning_content——
+      // 以及非 thinking 模型的历史消息、压缩摘要），用非空占位符回填：
+      // 空串会被严格上游当作缺失拒绝（Missing required parameter:
+      // 'messages[N].reasoning_content'），占位符保证字段「在场且非空」，
+      // 而真实值一律原样保留、不改写。
+      let reasoningText = null;
+      if (typeof msg.reasoning_content === 'string') {
+        if (msg.reasoning_content.trim() !== '') reasoningText = msg.reasoning_content;
+      } else if (msg.reasoning_content != null) {
+        reasoningText = String(msg.reasoning_content);
       }
+      if (reasoningText === null && Array.isArray(msg.content)) {
+        const rpart = msg.content.find(p => p && p.type === 'reasoning');
+        const t = rpart && (typeof rpart.text === 'string' ? rpart.text
+          : (typeof rpart.reasoning === 'string' ? rpart.reasoning : ''));
+        if (t && t.trim() !== '') reasoningText = t;
+      }
+      if (reasoningText === null) {
+        reasoningText = MISSING_REASONING_PLACEHOLDER;
+        missingReasoningCount++;
+      }
+      parts.push({ type: 'reasoning', text: reasoningText });
       if (msg.content && typeof msg.content === 'string') {
         if (msg.content) parts.push({ type: 'text', text: msg.content });
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (!part) continue;
           if (part.type === 'text') parts.push(part);
-          // 客户端直接把 reasoning 放在 content 数组里时同样透传；
-          // 已有 reasoning_content 字段则不重复
-          else if (part.type === 'reasoning' && !msg.reasoning_content) parts.push(part);
+          // reasoning 块已统一在上方处理（真实文本已并入 reasoningText，
+          // 此处不再重复下发 content 数组里的 reasoning 块）
         }
       }
       if (msg.tool_calls) {
@@ -802,6 +832,13 @@ function buildCcRequest(openaiReq) {
   }
   if (temperature !== undefined) {
     body.params.temperature = temperature;
+  }
+  // reasoning_effort 照常下发：缺失的 reasoning 已被非空占位符回填、历史
+  // 重新合法，没有理由为此牺牲当前轮的 thinking。（早先版本曾在缺失时整段
+  // 不下发 reasoning_effort —— 对「按模型决定 thinking」的上游无效，且白白
+  // 关掉当前轮推理。）
+  if (missingReasoningCount > 0) {
+    log('info', 'Backfilled missing reasoning_content with placeholder', { count: missingReasoningCount, model: body.params.model });
   }
   if (reasoning_effort !== undefined) {
     body.params.reasoning_effort = reasoning_effort;
