@@ -779,6 +779,7 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 ### 其它注意事项
 
 - **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
+- **日志时间戳为宿主机本地时间**：形状 `[2026-10-30 16:19:43.726] [info] ...`，不带时区偏移标记。若把 stdout / `logFile` 收集到集中式日志系统（promtail/Loki、fluent-bit），需在采集侧指定来源时区 —— 行内不携带偏移。
 - **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
 - **按内容派生的 session id**：客户端不带 session header 时，id 是 `apiKey + model + system + 首个非 user 消息之前的连续 user 文本` 的哈希 —— 这段前缀里任何变化（system 里带当天日期、中途换 model）都会让同一场对话中途换 id，进而导致缓存重建。需要精确控制时请由客户端下发 `x-session-id` 或 `prompt_cache_key`。
 - **多账号 + 多实例**：唯一的进程内状态只剩 `keyStateStore`（每 key 一份确定性指纹 + 初始化节流）。同一个 API key 打到两个实例，报告的设备指纹与 session id 都是**同一个** —— 前提是各实例的 `CC_FINGERPRINT_SALT` 与 `CC_DEVICE_PROJECT_DIR` 保持一致，否则指纹会分叉。只有 fingerprint/lifecycle 预请求的节流是各实例独立的，所以两个实例可能落在同一时间窗内各发一轮初始化。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
