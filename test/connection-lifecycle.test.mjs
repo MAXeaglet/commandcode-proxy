@@ -67,11 +67,19 @@ test('message 里的 "<NNN>" 前缀优先于 statusCode（对齐 CLI 的取值�
 // ── ② 无内容事件不应产生 Unknown CC event type 警告 ────────────
 // 上游每个响应都会发一串不携带内容的事件（text-start / text-end / start /
 // start-step / reasoning-start / reasoning-end / provider-metadata /
-// tool-input-start|delta|end / tool-error）。Responses 非流式那条路径原先
-// 一个静默列表都没有，每个响应刷十来条 warn，真正的错误被淹没。
+// tool-input-start|delta|end / tool-error / cache-write-tokens[1.88.2 新增]）。
+// Responses 非流式那条路径原先一个静默列表都没有，每个响应刷十来条 warn，
+// 真正的错误被淹没。
 
 test('标准 NDJSON 序列不产生任何 Unknown CC event type 警告（三协议 × 流式/非流式）', async () => {
-  const s = await setup();
+  const s = await setup({ ndjson: [
+    '{"type":"text-start"}',
+    '{"type":"cache-write-tokens","cacheWriteTokens":42}',
+    '{"type":"text-delta","text":"hello"}',
+    '{"type":"text-end"}',
+    '{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":3}}',
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":9,"outputTokens":3,"cachedInputTokens":0}}',
+  ] });
   try {
     const msg = { model: 'm', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] };
     await (await s.proxy.post('/v1/chat/completions', { ...CHAT, stream: true }, AUTH)).text();

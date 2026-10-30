@@ -66,7 +66,7 @@ test('请求头集合与 CLI 的 buildCommandAuthHeaders 一致（无 x-co-flag�
     assert.equal(headers['x-taste-learning'], 'false', 'toString() 的字符串，不是布尔');
     assert.equal(headers['x-project-slug'], 'c-users-dev-projects-app',
       'x-project-slug = slugify(workingDir)，盘符保留（@sindresorhus/slugify 的结果）');
-    assert.ok(headers['x-command-code-version']);
+    assert.equal(headers['x-command-code-version'], '1.88.2', '报告实际实现的协议版本');
     assert.ok(headers.traceparent);
   } finally { await s.close(); }
 });

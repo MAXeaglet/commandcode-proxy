@@ -64,7 +64,7 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.54.0 复核未变） ──
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI；1.53.1 对齐，1.54.0 复核未变，1.88.2 复核仍未变） ──
 // CPU 型号与核数对应表（仅 Windows x64）。
 // ⚠️ 上网的 components.cpuCount 必须是 **threads** 而不是 cores ——
 // CLI 的 gatherRawSignals 取的是 `os.cpus().length`，即**逻辑处理器数**。
@@ -207,11 +207,11 @@ function generateFingerprint(apiKey) {
   };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.53.1 源码）。
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.88.2 源码）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
-const CC_PROTOCOL_VERSION = '1.53.1';
+const CC_PROTOCOL_VERSION = '1.88.2';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
@@ -1008,7 +1008,7 @@ function createSseTranslator(model, completionId, created) {
           break;
         }
 
-        case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+        case 'reasoning-end': case 'provider-metadata': case 'cache-write-tokens': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
           // Silent - no user-visible content
           break;
         default:
@@ -1897,7 +1897,7 @@ async function handleChatCompletions(req, res) {
               // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
               case 'text-start': case 'text-end': case 'start': case 'start-step':
               case 'reasoning-start': case 'reasoning-end':
-              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'provider-metadata': case 'cache-write-tokens': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
               case 'tool-error':
                 // Silent - no user-visible content
                 break;
@@ -2497,7 +2497,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             break;
           }
 
-          case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+          case 'reasoning-end': case 'provider-metadata': case 'cache-write-tokens': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
             // Silent - no user-visible content
             break;
           default:
@@ -2832,7 +2832,7 @@ async function handleMessages(req, res) {
               // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
               case 'text-start': case 'text-end': case 'start': case 'start-step':
               case 'reasoning-start': case 'reasoning-end':
-              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'provider-metadata': case 'cache-write-tokens': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
               case 'tool-error':
                 // Silent - no user-visible content
                 break;
@@ -2925,6 +2925,10 @@ async function handleMessages(req, res) {
 
 let dynamicModels = null;
 let modelsLastFetch = 0;
+// 1.88.2 CLI 的目录刷新（createModelCatalogManager.fetchOnce）用裸 fetch、**不带认证**，
+// 只发 accept + if-none-match(`"<catalogVersion>"`)；304 表示版本未变、沿用当前目录。
+// 这里对齐该可观测形状：catalogVersion 取自响应体，首次请求无版本可带。
+let catalogVersion = '';
 
 async function fetchModels(apiKey) {
   const now = Date.now();
@@ -2935,24 +2939,35 @@ async function fetchModels(apiKey) {
   try {
     if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
 
-    const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
+    const headers = { 'accept': 'application/json' };
+    if (catalogVersion) headers['if-none-match'] = `"${catalogVersion}"`;
+    let response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models?view=client`, {
+      headers,
       signal: AbortSignal.timeout(10000),
     });
 
+    if (response.status === 304) {
+      if (dynamicModels) {
+        modelsLastFetch = now;   // 版本未变：缓存继续有效
+        return dynamicModels;
+      }
+      // 无缓存可复用（正常流程不可达，但缓存被清空后会到达）：清掉版本号并无条件重取一次。
+      catalogVersion = '';
+      response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models?view=client`, {
+        headers: { 'accept': 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+    }
     if (response.ok) {
       const data = await response.json();
-      if (Array.isArray(data.data)) {
+      if (Array.isArray(data?.data)) {
+        if (typeof data.catalogVersion === 'string') catalogVersion = data.catalogVersion;
         dynamicModels = data.data.map(m => ({
           id: m.id,
-          name: m.id,
+          name: m.name || m.id,
         }));
         modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
+        log('info', 'Fetched models from Provider API', { count: dynamicModels.length, catalogVersion: catalogVersion || null });
         return dynamicModels;
       }
     }
@@ -3831,7 +3846,7 @@ async function handleResponses(req, res) {
             // 'Unknown CC event type'，线上刷屏、把真正的错误淹掉。
             case 'text-start': case 'text-end': case 'start': case 'start-step':
             case 'reasoning-start': case 'reasoning-end':
-            case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+            case 'provider-metadata': case 'cache-write-tokens': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
             case 'tool-error':
               // Silent - no user-visible content
               break;
