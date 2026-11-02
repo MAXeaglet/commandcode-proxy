@@ -363,7 +363,8 @@ Anthropic 客户端——依赖的是由 Anthropic 服务器执行的**服务端
   （Command Code 的 `tool_choice` 没有 `none`）；模型若仍持续调用，代理会本地收尾，保证一定发出 `message_stop`。
 - 历史里上一轮的 `server_tool_use` / `web_search_tool_result` 块会被回放成 tool call / tool result 消息，多轮对话不受影响。
 - 结果来自 Command Code 的搜索后端（DuckDuckGo），赞助结果已过滤；`allowed_domains` / `blocked_domains` 按 hostname 生效。
-- 仅流式；非流式 `/v1/messages` 请求仍会剥掉服务端工具。`web_fetch_20250910` 未实现（Claude Code 的 Fetch 在客户端执行，不依赖它）。
+- 流式、非流式 `/v1/messages` 都支持。非流式走同一套搜索循环，各轮的 `thinking` / `text` / `server_tool_use` / `web_search_tool_result`
+  块拼进同一条 message，`usage` 跨轮累加（dsh 这类客户端的搜索请求是非流式的）。`web_fetch_20250910` 未实现（Claude Code 的 Fetch 在客户端执行，不依赖它）。
 - 每次搜索消耗一次 `/alpha/web-search` 调用外加一轮额外的 `/alpha/generate`，都计入你的 Command Code 配额；配置了 `CC_UPSTREAM_PROXY` 时同样经代理发出。
   单次搜索超时：`CC_WEB_SEARCH_TIMEOUT_MS`（默认 `8000`）。
 

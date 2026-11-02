@@ -2211,41 +2211,6 @@ function fakeThinkingSignature(thinkingText) {
   return raw.toString('base64');
 }
 
-function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText) {
-  const content = [];
-  if (thinkingText) content.push({ type: 'thinking', thinking: thinkingText, signature: fakeThinkingSignature(thinkingText) });
-  if (fullText) content.push({ type: 'text', text: fullText });
-  if (toolCalls) {
-    for (const tc of toolCalls) {
-      let input = {};
-      try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
-      content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
-    }
-  }
-  return {
-    id: `msg_${randomUUID().slice(0, 12)}`,
-    type: 'message',
-    role: 'assistant',
-    model,
-    content,
-    stop_reason: mapAnthropicStopReason(finishReason || 'stop'),
-    stop_sequence: null,
-    usage: (() => {
-      normalizeUsage(usage || {});
-      // CC 未回报 usage 时按内容长度估算输出 token，避免客户端展示/记账为 0
-      const estOut = Math.max(1,
-        Math.ceil(((fullText || '').length + (thinkingText || '').length) / 4) + (toolCalls ? toolCalls.length * 20 : 0));
-      return {
-        // input_tokens 只计非缓存部分（Anthropic 语义），与 cache_* 相加才等于总输入
-        input_tokens: anthropicInputTokens(usage),
-        output_tokens: usage?.outputTokens || estOut,
-        cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? 0,
-        cache_read_input_tokens: usage?.cachedInputTokens ?? 0,
-      };
-    })(),
-  };
-}
-
 // Anthropic 服务端工具的 type → 内部种类。这类工具没有 input_schema，由 Anthropic 服务器执行；
 // 经 CC 上游时只能由本 proxy 代为执行（web_search 已实现，见 executeWebSearch）或剥掉。
 const SERVER_TOOL_TYPES = {
@@ -2811,13 +2776,6 @@ async function handleMessages(req, res) {
 
   // Convert Anthropic → OpenAI → CC
   let openaiReq = convertAnthropicToOpenAI(anthropicReq);
-  if (!stream && openaiReq._serverTools) {
-    // 搜索循环只实现了流式（Claude Code 只走流式）；非流式退回剥掉服务端工具
-    const names = new Set(Object.keys(openaiReq._serverTools));
-    openaiReq.tools = (openaiReq.tools || []).filter(t => !names.has(t.function?.name));
-    if (!openaiReq.tools.length) delete openaiReq.tools;
-    delete openaiReq._serverTools;
-  }
   let ccBody = buildCcRequest(openaiReq); // 搜索循环每轮追加历史后重建
 
   const abortController = new AbortController();
@@ -3111,117 +3069,254 @@ async function handleMessages(req, res) {
       if (!res.writableEnded) res.end();
     } else {
       // ── 非流式 Anthropic JSON ──
-      const messageId = 'msg_' + randomUUID().slice(0, 12);
+      // 与流式路径同一套搜索循环：模型调 web_search → 本 proxy 执行 → 以 tool_calls + tool 消息
+      // 追加历史重发上游 → 模型续写。各轮的 thinking / text / server_tool_use / web_search_tool_result
+      // 块按先后顺序拼进同一条 message，usage 跨轮累加，和 Anthropic 非流式响应的形状一致。
+      // 之前非流式把服务端工具剥掉：模型不知道能搜，响应里自然没有 web_search_tool_result——
+      // Claude Code 只走流式所以没暴露，dsh 这类硬编码非流式的客户端一用就撞上。
+      messageId = 'msg_' + randomUUID().slice(0, 12);
+      const serverTools = openaiReq._serverTools || null;
+      const maxSearchRounds = serverTools
+        ? Math.min(10, Object.values(serverTools).reduce((s, t) => s + t.maxUses, 0))
+        : 0;
+      const content = [];
+      const agg = { input: 0, output: 0, cached: 0, cacheWrite: 0 };
+      let searchCount = 0;
+      let exhaustedRounds = 0; // 连续"全部 max_uses_exceeded"的轮数
       let finishReason = 'stop';
-      let sawFinish = false;
-      let usage = null;
-      let toolCalls = null;
-      let thinkingText = ''; // CC reasoning → Anthropic thinking block
-      let upstreamError = null;
+      let roundResponse = ccResponse;
 
-      reader = ccResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
+      // 读完一轮 CC NDJSON。超时 / 读错误直接抛给外层 catch，外层日志用的 fullText、
+      // lastCcEvent、bytesReceived、reader 在这里持续更新。
+      const readRound = async (resp) => {
+        const round = { text: '', thinking: '', toolCalls: null, finishReason: 'stop', sawFinish: false, usage: null, upstreamError: null };
+        reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
 
-      const processLines = () => {
-        const lines = buf.split('\n');
-        buf = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === '[DONE]') continue;
-          try {
-            const event = JSON.parse(trimmed);
-            switch (event.type) {
-              case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
-              case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
-              case 'tool-call':
-                lastCcEvent = event.type;
-                (toolCalls = toolCalls || []).push({
-                  id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
-                  type: 'function',
-                  function: {
-                    name: event.toolName || '',
-                    arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-                  },
-                });
-                break;
-              case 'finish-step':
-              case 'finish':
-                lastCcEvent = event.type;
-                sawFinish = true;
-                finishReason = mapFinishReason(event.finishReason || 'stop');
-                if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
-                break;
-              case 'error':
-                lastCcEvent = event.type;
-                upstreamError = mapCcEventError(event);
-                log('warn', 'CC error (Anthropic non-stream)', {
-                  message: event.error?.message || event.message,
-                  upstreamStatus: upstreamError.reportedStatus,
-                  upstreamRetryable: event.error?.isRetryable,
-                  code: upstreamError.code,
-                  mappedTo: upstreamError.status,
-                });
-                break;
-              // 无内容的事件：与流式翻译器的静默列表保持一致。
-              // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
-              // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
-              // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
-              case 'text-start': case 'text-end': case 'start': case 'start-step':
-              case 'reasoning-start': case 'reasoning-end':
-              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
-              case 'tool-error':
-                // Silent - no user-visible content
-                break;
-              default:
-                log('warn', 'Unknown CC event type', { type: event.type });
-                break;
-            }
-          } catch {}
+        const processLines = () => {
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === '[DONE]') continue;
+            try {
+              const event = JSON.parse(trimmed);
+              switch (event.type) {
+                case 'text-delta': lastCcEvent = event.type; round.text += event.text || ''; fullText += event.text || ''; break;
+                case 'reasoning-delta': lastCcEvent = event.type; round.thinking += event.text || ''; break;
+                case 'tool-call':
+                  lastCcEvent = event.type;
+                  (round.toolCalls = round.toolCalls || []).push({
+                    id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
+                    type: 'function',
+                    function: {
+                      name: event.toolName || '',
+                      arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+                    },
+                  });
+                  break;
+                case 'finish-step':
+                case 'finish':
+                  lastCcEvent = event.type;
+                  round.sawFinish = true;
+                  round.finishReason = mapFinishReason(event.finishReason || 'stop');
+                  if (event.totalUsage || event.usage) round.usage = event.totalUsage || event.usage;
+                  break;
+                case 'error':
+                  lastCcEvent = event.type;
+                  round.upstreamError = mapCcEventError(event);
+                  log('warn', 'CC error (Anthropic non-stream)', {
+                    message: event.error?.message || event.message,
+                    upstreamStatus: round.upstreamError.reportedStatus,
+                    upstreamRetryable: event.error?.isRetryable,
+                    code: round.upstreamError.code,
+                    mappedTo: round.upstreamError.status,
+                  });
+                  break;
+                // 无内容的事件：与流式翻译器的静默列表保持一致。
+                // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
+                // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
+                // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
+                case 'text-start': case 'text-end': case 'start': case 'start-step':
+                case 'reasoning-start': case 'reasoning-end':
+                case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+                case 'tool-error':
+                  // Silent - no user-visible content
+                  break;
+                default:
+                  log('warn', 'Unknown CC event type', { type: event.type });
+                  break;
+              }
+            } catch {}
+          }
+        };
+
+        const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
+        try {
+          while (true) {
+            const result = await Promise.race([reader.read(), idle.arm()]);
+            const { done, value } = result;
+            if (done) break;
+            bytesReceived += value.length;
+            const chunkText = decoder.decode(value, { stream: true });
+            buf += chunkText;
+            // 无换行则不可能产生完整行，跳过全量 split
+            if (chunkText.indexOf('\n') !== -1) processLines();
+          }
+        } finally {
+          idle.dispose();
         }
+        processLines();
+        return round;
       };
 
-      const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
-      while (true) {
-        const result = await Promise.race([reader.read(), idle.arm()]);
-        const { done, value } = result;
-        if (done) break;
-        bytesReceived += value.length;
-        const chunkText = decoder.decode(value, { stream: true });
-        buf += chunkText;
-        // 无换行则不可能产生完整行，跳过全量 split
-        if (chunkText.indexOf('\n') !== -1) processLines();
-      }
-      idle.dispose();
-      processLines();
+      for (let round = 0; ; round++) {
+        const r = await readRound(roundResponse);
 
-      if (upstreamError) {
-        sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
-        return;
-      }
+        if (r.upstreamError) {
+          sendAnthropicError(res, r.upstreamError.status, r.upstreamError.body.error.type, r.upstreamError.body.error.message);
+          return;
+        }
 
-      // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
-      {
-        const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
-        if (incomplete) {
-          log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
-          const err = incompleteUpstreamError(incomplete);
-          try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-          sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+        // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
+        {
+          const incomplete = incompleteUpstreamDetail(r.sawFinish, r.finishReason);
+          if (incomplete) {
+            log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+            const err = incompleteUpstreamError(incomplete);
+            try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+            sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+            return;
+          }
+        }
+
+        // usage 跨轮累加。input_tokens 只计非缓存部分（Anthropic 语义）；CC 未回报 usage 时按
+        // 内容长度估算输出 token，避免客户端展示/记账为 0
+        const u = r.usage || {};
+        normalizeUsage(u);
+        const estOut = Math.max(1,
+          Math.ceil((r.text.length + r.thinking.length) / 4) + (r.toolCalls ? r.toolCalls.length * 20 : 0));
+        agg.input += anthropicInputTokens(u);
+        agg.output += u.outputTokens || estOut;
+        agg.cached += u.cachedInputTokens ?? 0;
+        agg.cacheWrite += u.inputTokenDetails?.cacheWriteTokens ?? 0;
+        finishReason = r.finishReason;
+
+        if (r.thinking) content.push({ type: 'thinking', thinking: r.thinking, signature: fakeThinkingSignature(r.thinking) });
+        if (r.text) content.push({ type: 'text', text: r.text });
+        // 服务端工具（web_search）不当客户端 tool_use 下发——客户端没有它的处理器——改成
+        // server_tool_use 块并登记待执行；其余照常 tool_use。
+        const pending = [];
+        for (const tc of r.toolCalls || []) {
+          let input = {};
+          try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
+          if (serverTools && serverTools[tc.function.name]) {
+            const srvId = 'srvtoolu_' + randomUUID().slice(0, 12);
+            content.push({ type: 'server_tool_use', id: srvId, name: tc.function.name, input });
+            pending.push({ id: srvId, name: tc.function.name, input, upstreamToolCallId: tc.id });
+          } else {
+            content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+          }
+        }
+        if (!pending.length) break;
+
+        if (round > maxSearchRounds) {
+          // 失控保护：轮数封顶。补错误结果块并本地收尾，保证每个调用块都有配对结果。
+          for (const p of pending) {
+            content.push({ type: 'web_search_tool_result', tool_use_id: p.id, content: { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' } });
+          }
+          finishReason = 'stop';
+          log('warn', 'Web search loop finalized locally', { why: `round cap ${maxSearchRounds} exceeded`, id: messageId, streaming: false });
+          break;
+        }
+
+        const assistantToolCalls = [];
+        const toolMessages = [];
+        for (const p of pending) {
+          const tool = serverTools[p.name];
+          let result;
+          if (tool.used >= tool.maxUses) {
+            result = { errorCode: 'max_uses_exceeded' };
+          } else {
+            tool.used++;
+            searchCount++;
+            result = await executeWebSearch(p.input?.query, apiKey, req.headers, abortController.signal, {
+              allowedDomains: tool.allowedDomains,
+              blockedDomains: tool.blockedDomains,
+            });
+          }
+          content.push({
+            type: 'web_search_tool_result', tool_use_id: p.id,
+            content: result.errorCode ? { type: 'web_search_tool_result_error', error_code: result.errorCode } : result.blocks,
+          });
+          assistantToolCalls.push({ id: p.upstreamToolCallId, type: 'function', function: { name: p.name, arguments: JSON.stringify(p.input || {}) } });
+          toolMessages.push({
+            role: 'tool', tool_call_id: p.upstreamToolCallId, name: p.name,
+            content: result.errorCode ? `Search failed: ${result.errorCode}` : result.textForModel,
+          });
+        }
+        if (aborted) return;
+
+        // 模型拿到 max_uses_exceeded 还连续再调 → 不再上游，本地收尾
+        const allExhausted = toolMessages.every(m => m.content.startsWith('Search failed: max_uses_exceeded'));
+        exhaustedRounds = allExhausted ? exhaustedRounds + 1 : 0;
+        if (exhaustedRounds >= 2) {
+          finishReason = 'stop';
+          log('warn', 'Web search loop finalized locally', { why: 'model kept calling after max_uses_exceeded', id: messageId, streaming: false });
+          break;
+        }
+
+        // 追加历史：assistant{本轮文本 + tool_calls (+ reasoning：CC 在 thinking 模式下校验它随历史带回)} → tool 结果
+        const assistantMsg = { role: 'assistant', content: r.text || null, tool_calls: assistantToolCalls };
+        if (r.thinking) assistantMsg.reasoning_content = r.thinking;
+        openaiReq.messages.push(assistantMsg, ...toolMessages);
+        // 额度用完的服务端工具移出定义：模型物理上不能再调，客户端工具不受影响
+        const exhausted = new Set(Object.keys(serverTools).filter(n => serverTools[n].used >= serverTools[n].maxUses));
+        if (exhausted.size && Array.isArray(openaiReq.tools)) {
+          openaiReq.tools = openaiReq.tools.filter(t => !exhausted.has(t.function?.name));
+          const tc = openaiReq.tool_choice;
+          if (tc === 'required' || (tc && typeof tc === 'object' && exhausted.has(tc.function?.name))) openaiReq.tool_choice = 'auto';
+          if (!openaiReq.tools.length) { delete openaiReq.tools; delete openaiReq.tool_choice; }
+        }
+        ccBody = buildCcRequest(openaiReq);
+        log('info', 'Web search round', { round: round + 1, searches: assistantToolCalls.length, removedTools: [...exhausted], id: messageId, streaming: false });
+
+        roundResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+        if (!roundResponse.ok) {
+          const errorText = await roundResponse.text().catch(() => '');
+          const mapped = mapCcError(roundResponse.status, errorText);
+          log('error', 'CC API error (web search round)', { status: roundResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
+          sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
           return;
         }
       }
 
-      // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
-      // 会把有完整文本的响应误杀成 429
-      if (!fullText && !thinkingText && !toolCalls) {
+      // 零输出判定按实际内容：上游偶发不回 totalUsage 时，按 usage 判会把有完整文本的响应误杀成 429
+      if (!content.length) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
         return;
       }
 
       consecutiveTimeouts = 0;
-      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
+      const usage = {
+        input_tokens: agg.input,
+        output_tokens: agg.output,
+        cache_creation_input_tokens: agg.cacheWrite,
+        cache_read_input_tokens: agg.cached,
+      };
+      if (searchCount) usage.server_tool_use = { web_search_requests: searchCount };
+      sendJSON(res, 200, {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        model,
+        content,
+        stop_reason: mapAnthropicStopReason(finishReason || 'stop'),
+        stop_sequence: null,
+        usage,
+      });
     }
   } catch (e) {
     if (abortController.signal.aborted) {

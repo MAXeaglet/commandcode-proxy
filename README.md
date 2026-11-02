@@ -376,8 +376,11 @@ and the request is re-sent upstream → the model continues in the same message
   call / tool result messages, so multi-turn conversations keep working.
 - Results come from Command Code's search backend (DuckDuckGo). Sponsored results are filtered out;
   `allowed_domains` / `blocked_domains` are applied on hostnames.
-- Streaming only — a non-streaming `/v1/messages` request still has server tools stripped.
-  `web_fetch_20250910` is not implemented (Claude Code's Fetch runs client-side and does not need it).
+- Works for both streaming and non-streaming `/v1/messages`. A non-streaming request gets the same
+  search loop, with every round's `thinking` / `text` / `server_tool_use` / `web_search_tool_result`
+  blocks assembled into one message and `usage` summed across rounds (clients such as dsh send their
+  search requests non-streaming). `web_fetch_20250910` is not implemented (Claude Code's Fetch runs
+  client-side and does not need it).
 - Each search costs one `/alpha/web-search` call plus one extra `/alpha/generate` round against your
   Command Code quota, and goes through `CC_UPSTREAM_PROXY` when one is configured. Per-search timeout:
   `CC_WEB_SEARCH_TIMEOUT_MS` (default `8000`).

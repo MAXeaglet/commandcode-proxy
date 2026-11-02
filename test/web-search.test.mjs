@@ -172,16 +172,134 @@ test('web_search：未开 CC_WEB_SEARCH 时服务端工具被剥掉，不再变�
   } finally { await s.close(); }
 });
 
-test('web_search：非流式 /v1/messages 不走循环，服务端工具被剥掉', async () => {
-  const s = await setup({ ndjson: ROUND2, env: { CC_WEB_SEARCH: '1' } });
+// ── 非流式 ────────────────────────────────────────────────
+// dsh 这类客户端的搜索请求是硬编码非流式的（fetch 后直接 response.json()）。
+// 之前非流式把服务端工具剥掉，模型不知道能搜，响应里就没有 web_search_tool_result。
+
+async function messagesJSON(s, body) {
+  const r = await s.proxy.post('/v1/messages',
+    { model: 'm', max_tokens: 200, ...body },
+    { 'x-api-key': 'user_test' });
+  return { status: r.status, body: await r.json() };
+}
+
+test('web_search 非流式：同一套循环，thinking/text/server_tool_use/web_search_tool_result/text 拼成一条 message，usage 跨轮累加', async () => {
+  const s = await setup(scriptedUpstream([ROUND1, ROUND2]));
   try {
-    const r = await s.proxy.post('/v1/messages',
-      { model: 'm', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }], tools: [WEB_SEARCH_TOOL, READ_TOOL] },
-      { 'x-api-key': 'user_test' });
-    assert.equal(r.status, 200);
+    const { status, body } = await messagesJSON(s, {
+      messages: [{ role: 'user', content: 'what is deepseek v4 flash' }],
+      tools: [WEB_SEARCH_TOOL, READ_TOOL],
+    });
+    assert.equal(status, 200);
+    assert.equal(body.type, 'message');
+    assert.equal(body.stop_reason, 'end_turn');
+    assert.deepEqual(body.content.map(b => b.type),
+      ['thinking', 'text', 'server_tool_use', 'web_search_tool_result', 'text'], '各轮块按先后顺序拼接');
+
+    const [thinking, text1, srv, result, text2] = body.content;
+    assert.equal(thinking.thinking, 'need fresh info');
+    assert.equal(text1.text, 'Let me search.');
+    assert.equal(srv.name, 'web_search');
+    assert.ok(srv.id.startsWith('srvtoolu_'));
+    assert.deepEqual(srv.input, { query: 'deepseek v4 flash' }, 'server_tool_use.input 是解析后的对象，不是字符串');
+    assert.equal(result.tool_use_id, srv.id, '结果块与调用块配对');
+    assert.equal(result.content.length, 2, '赞助结果必须被剥掉');
+    assert.ok(result.content.every(r => r.type === 'web_search_result' && r.encrypted_content));
+    assert.equal(text2.text, 'DeepSeek V4 Flash has a 1M context.');
+    assert.ok(!body.content.some(b => b.type === 'tool_use'), '服务端工具不能泄漏成客户端 tool_use');
+
+    assert.equal(body.usage.output_tokens, 7 + 11, '两轮 output 汇总');
+    assert.equal(body.usage.input_tokens, 100 + 150, '两轮 input 汇总');
+    assert.deepEqual(body.usage.server_tool_use, { web_search_requests: 1 });
+
+    // 上游侧与流式一致：第 2 轮带回 assistant{reasoning + 文本 + tool-call} → tool-result
+    assert.equal(s.mock.generateCount(), 2);
+    const wire = JSON.stringify(s.mock.lastGenerate().body.params.messages);
+    assert.ok(wire.includes('"toolCallId":"call_1"') && wire.includes('"toolName":"web_search"'));
+    assert.ok(wire.includes('need fresh info') && wire.includes('Let me search.'));
+    assert.ok(wire.includes('tool-result') && wire.includes('DeepSeek | Into the Unknown'));
+    assert.ok(!wire.includes('duckduckgo.com/y.js'), '广告不能喂给模型');
+    const searchReqs = s.mock.seen.filter(x => x.url === '/alpha/web-search');
+    assert.equal(searchReqs.length, 1);
+    assert.equal(searchReqs[0].headers['authorization'], 'Bearer user_test', '用同一把 key');
+  } finally { await s.close(); }
+});
+
+test('web_search 非流式：没有服务端工具调用时行为不变——普通 tool_use、stop_reason=tool_use、只打一次上游', async () => {
+  const s = await setup({ ndjson: ROUND_READ, env: { CC_WEB_SEARCH: '1' } });
+  try {
+    const { status, body } = await messagesJSON(s, {
+      messages: [{ role: 'user', content: 'read a.py' }],
+      tools: [WEB_SEARCH_TOOL, READ_TOOL],
+    });
+    assert.equal(status, 200);
+    assert.deepEqual(body.content, [{ type: 'tool_use', id: 'call_r', name: 'Read', input: { path: 'a.py' } }]);
+    assert.equal(body.stop_reason, 'tool_use');
+    assert.equal(body.usage.output_tokens, 5);
+    assert.equal(body.usage.server_tool_use, undefined, '没搜索就不该带 server_tool_use');
+    assert.equal(s.mock.generateCount(), 1);
     const tools = s.mock.lastGenerate().body.params.tools;
-    assert.ok(!tools.some(t => t.name === 'web_search'));
-    assert.ok(tools.some(t => t.name === 'Read'));
+    assert.ok(tools.some(t => t.name === 'web_search') && tools.some(t => t.name === 'Read'), '非流式也要把 web_search 下发给模型');
+  } finally { await s.close(); }
+});
+
+test('web_search 非流式：超过 max_uses → 错误结果块、不再打搜索端点、末轮禁工具、正常收尾', async () => {
+  const ROUND1b = ROUND1.map(l => l.replace('"call_1"', '"call_2"'));
+  const s = await setup(scriptedUpstream([ROUND1, ROUND1b, ROUND2]));
+  try {
+    const { status, body } = await messagesJSON(s, {
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ ...WEB_SEARCH_TOOL, max_uses: 1 }],
+    });
+    assert.equal(status, 200);
+    const results = body.content.filter(b => b.type === 'web_search_tool_result');
+    assert.equal(results.length, 2);
+    assert.ok(Array.isArray(results[0].content), '第一次是真结果');
+    assert.deepEqual(results[1].content, { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' });
+    assert.equal(s.mock.seen.filter(x => x.url === '/alpha/web-search').length, 1, '超额不再打搜索端点');
+    assert.equal(body.stop_reason, 'end_turn');
+    assert.deepEqual(body.usage.server_tool_use, { web_search_requests: 1 });
+    assert.equal(body.usage.output_tokens, 7 + 7 + 11, '三轮 output 汇总');
+
+    const gens = s.mock.seen.filter(x => x.url === '/alpha/generate');
+    assert.equal(gens.length, 3);
+    const secondReq = JSON.parse(gens[1].raw).params;
+    assert.ok(!(secondReq.tools || []).some(t => t.name === 'web_search'), '额度用完后 web_search 要从工具定义里移除');
+    assert.equal(secondReq.tool_choice, undefined, '工具全被移除时不能再带 tool_choice');
+    assert.ok(JSON.parse(gens[2].raw).params.messages.some(m => JSON.stringify(m).includes('Search failed: max_uses_exceeded')));
+  } finally { await s.close(); }
+});
+
+test('web_search 非流式：工具已移出定义模型仍持续调用 → 本地收尾，每个调用块都有配对结果，不无限循环', async () => {
+  const s = await setup(scriptedUpstream([ROUND1]));
+  try {
+    const { status, body } = await messagesJSON(s, {
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [{ ...WEB_SEARCH_TOOL, max_uses: 1 }],
+    });
+    assert.equal(status, 200);
+    assert.equal(body.stop_reason, 'end_turn');
+    assert.ok(s.mock.generateCount() <= 3, `上游调用应被封顶，实际 ${s.mock.generateCount()}`);
+    const calls = body.content.filter(b => b.type === 'server_tool_use');
+    const results = body.content.filter(b => b.type === 'web_search_tool_result');
+    assert.equal(results.length, calls.length);
+    assert.ok(results.every(r => calls.some(c => c.id === r.tool_use_id)));
+  } finally { await s.close(); }
+});
+
+test('web_search 非流式：搜索端点 5xx → unavailable 错误块，模型仍续写收尾', async () => {
+  const s = await setup(scriptedUpstream([ROUND1, ROUND2], (req, res) => json(res, { error: 'boom' }, 500)));
+  try {
+    const { status, body } = await messagesJSON(s, {
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [WEB_SEARCH_TOOL],
+    });
+    assert.equal(status, 200);
+    const result = body.content.find(b => b.type === 'web_search_tool_result');
+    assert.deepEqual(result.content, { type: 'web_search_tool_result_error', error_code: 'unavailable' });
+    assert.ok(body.content.some(b => b.type === 'text' && b.text === 'DeepSeek V4 Flash has a 1M context.'));
+    assert.ok(JSON.stringify(s.mock.lastGenerate().body.params.messages).includes('Search failed: unavailable'));
+    assert.deepEqual(body.usage.server_tool_use, { web_search_requests: 1 }, '请求已发出、配额已消耗，照计');
   } finally { await s.close(); }
 });
 
