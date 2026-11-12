@@ -1476,9 +1476,51 @@ async function proxyFetch(urlStr, options = {}) {
   });
 }
 
-/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
-function upstreamFetch(urlStr, options) {
-  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
+// ── 隧道传输层重试 + 直连回退 ───────────────────────
+// 已配 CC_UPSTREAM_PROXY 时，隧道本身可能不可用（代理进程重启 / 线路抖动：
+// TLS 握手被对端掐断、首包后 RST）。#50 的流级重试救不了这一层 —— 它重试时
+// 仍走原路（隧道），代理不可用则每次都失败，客户端只会看到连续 502。
+// 传输层失败不是请求本身的问题：等一小段退避再走一次隧道，仍失败则这一条请求
+// 改走直连 —— 代理不可用时退化为「慢但可用」，而不是把 502 抛给客户端。
+// 边界：客户端主动取消（AbortError / signal 已 abort）不算传输失败，
+// 已 abort 就不再发起新尝试，也不会在退避后改走直连。
+const PROXY_RETRY_DELAY_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_UPSTREAM_PROXY_RETRY_DELAY_MS ?? '', 10);
+  return Number.isFinite(ms) && ms >= 0 ? ms : 200;
+})();
+
+const TRANSPORT_CODES = new Set([
+  'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
+  'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED',
+]);
+
+function isTransportFailure(e) {
+  if (!e || e.name === 'AbortError') return false;
+  const code = e.code || e.cause?.code;
+  if (code && TRANSPORT_CODES.has(code)) return true;
+  const message = String(e.message || '');
+  return /aborted|socket hang up|other side closed|Client network socket disconnected|secure TLS connection|fetch failed|terminated/i.test(message);
+}
+
+/** 上游请求入口：配了代理走隧道（传输层失败重试一次后回退直连），否则用原生 fetch（行为不变）。 */
+async function upstreamFetch(urlStr, options) {
+  if (!UPSTREAM_PROXY) return fetch(urlStr, options);
+  const signal = options?.signal;
+  const retryable = () => !(signal && signal.aborted);
+  try {
+    return await proxyFetch(urlStr, options);
+  } catch (e) {
+    if (!retryable() || !isTransportFailure(e)) throw e;
+    log('warn', 'Upstream proxy attempt failed, retrying', { error: e.message, code: e.code ?? null });
+    await new Promise((r) => setTimeout(r, PROXY_RETRY_DELAY_MS));
+    try {
+      return await proxyFetch(urlStr, options);
+    } catch (e2) {
+      if (!retryable() || !isTransportFailure(e2)) throw e2;
+      log('warn', 'Upstream proxy retry failed, falling back to direct', { error: e2.message, code: e2.code ?? null });
+      return fetch(urlStr, options);
+    }
+  }
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -4025,6 +4067,9 @@ server.listen(CFG.port, CFG.host, () => {
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
+    upstreamProxyFallback: UPSTREAM_PROXY
+      ? `on: 1 transport retry then direct fallback (delay ${PROXY_RETRY_DELAY_MS}ms)`
+      : 'n/a (no proxy configured)',
     upstreamRetry: UPSTREAM_RETRY_MAX > 0
       ? `${UPSTREAM_RETRY_MAX} retries, base ${UPSTREAM_RETRY_BASE_MS}ms (only before first byte)`
       : 'disabled (CC_UPSTREAM_RETRY_MAX=0)',

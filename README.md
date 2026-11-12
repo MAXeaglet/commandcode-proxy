@@ -75,6 +75,7 @@ commandcode/
 | `HOST` | `0.0.0.0` | Listen address → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
 | `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Upstream proxy" below → `upstreamProxy` |
+| `CC_UPSTREAM_PROXY_RETRY_DELAY_MS` | `200` | Delay before the single tunnel retry when the tunnel fails at the transport level; a second failure falls back to a direct call for that request; see [Proxy tunnel failure → direct fallback](#proxy-tunnel-failure--direct-fallback) |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
 | `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
@@ -178,6 +179,9 @@ CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 - Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against the **target hostname**, never against the proxy.
 - Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
 - Credentials in the proxy URL (`http://user:pass@host:port`) are never logged: only `host:port` shows up.
+- If the tunnel itself is unavailable (proxy down, flapping line), a transport-level failure retries the tunnel
+  once after a short delay, then falls back to a direct connection for that request — see
+  [Proxy tunnel failure → direct fallback](#proxy-tunnel-failure--direct-fallback).
 
 > Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 
@@ -690,6 +694,37 @@ CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # wider backoff (default 400ms)
 > **Scope**: the retry loop covers both the streaming and non-streaming paths of `/v1/chat/completions`.
 > `/v1/messages` and `/v1/responses` have a different structure and are not covered by this change (drops are still
 > reported as before).
+
+## Proxy tunnel failure → direct fallback
+
+`CC_UPSTREAM_PROXY` routes upstream traffic through a CONNECT tunnel. The retry above cannot help when the
+**tunnel itself** is unavailable — it retries along the same route, so a dead proxy fails every attempt.
+
+For a **transport-level** tunnel failure (`ECONNRESET` / `ECONNREFUSED` / `ETIMEDOUT` / `socket hang up` /
+`terminated` … — proxy process restarting, flapping line: TLS handshake cut off, RST right after the first
+packet) the proxy therefore retries the tunnel once after a short delay, and if that fails too, **falls back
+to a direct connection for that request**: a dead proxy degrades to "slower but working" instead of a wall
+of 502s.
+
+- Non-transport failures — a CONNECT answered with `403`/`407` (config or auth problem) — are surfaced as-is:
+  no retry, no silent rerouting.
+- A client abort cancels the request: no retry, no direct fallback, no extra upstream call.
+- With no proxy configured, `upstreamFetch` is a plain `fetch` — default behaviour is unchanged.
+
+| Env var | Default | Description |
+|---|---|---|
+| `CC_UPSTREAM_PROXY_RETRY_DELAY_MS` | `200` | Delay before the single tunnel retry |
+
+Logs: `Upstream proxy attempt failed, retrying` (first tunnel attempt failed) and
+`Upstream proxy retry failed, falling back to direct` (this request continues over a direct connection).
+The startup banner's `upstreamProxyFallback` field shows the effective setting.
+
+```bash
+CC_UPSTREAM_PROXY_RETRY_DELAY_MS=0 npm start    # retry the tunnel immediately before falling back
+```
+
+> **Note**: while the proxy stays down, every tunneled request pays one failed tunnel attempt plus the retry
+> delay before the direct call — this is a per-request fallback, not a circuit breaker.
 
 ## Memory & Deployment
 
