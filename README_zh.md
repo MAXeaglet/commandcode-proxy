@@ -75,6 +75,7 @@ commandcode/
 | `HOST` | `0.0.0.0` | 监听地址 → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
 | `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
+| `CC_UPSTREAM_PROXY_RETRY_DELAY_MS` | `200` | 隧道传输层失败时单次重试的延迟，仍失败则该条请求回退直连；见[隧道故障 → 直连回退](#隧道故障--直连回退) |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | 空 | 日志文件 → `logFile`（**同步写**，见[其它注意事项](#其它注意事项)）|
 | `CC_USE_PROVIDER_MODELS` | `true` | 动态拉取模型列表 → `useProviderModels` |
@@ -173,6 +174,8 @@ CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 - 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按**目标主机名**校验，绝不针对代理降级。
 - **指纹/lifecycle 预请求也走代理**是刻意的：若它们直连而上游生成走代理，同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
 - 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
+- 隧道本身不可用（代理进程重启、线路抖动）时，传输层失败会退避后重试一次隧道，仍失败则该条请求
+  改走直连 —— 见[隧道故障 → 直连回退](#隧道故障--直连回退)。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
 
@@ -686,6 +689,34 @@ CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # 退避拉长（默认 400ms）
 
 > **覆盖范围**：目前 `/v1/chat/completions` 的流式与非流式两条路径都接了重试循环；
 > `/v1/messages` 与 `/v1/responses` 结构不同，未在本次改动中覆盖（闪断仍按原样报错）。
+
+## 隧道故障 → 直连回退
+
+`CC_UPSTREAM_PROXY` 把发往上游的流量装进 CONNECT 隧道。上面的重试救不了**隧道本身**不可用的情况 ——
+它沿原路重试，代理挂了就每次都失败。
+
+因此对**传输层**隧道失败（`ECONNRESET` / `ECONNREFUSED` / `ETIMEDOUT` / `socket hang up` / `terminated`
+等 —— 对应代理进程重启、线路抖动：TLS 握手被掐断、首包后 RST），代理会退避后重试一次隧道，
+仍失败则**该条请求改走直连**：代理不可用时退化为「慢但可用」，而不是把 502 墙抛给客户端。
+
+- 非传输层失败 —— CONNECT 被回 `403`/`407`（配置或认证问题）—— 原样上抛：不重试、不悄悄换路。
+- 客户端主动取消（signal 已 abort）即终止：不重试、不回退直连、不多打一次上游。
+- 未配代理时 `upstreamFetch` 就是原生 `fetch` —— 默认路径行为不变。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `CC_UPSTREAM_PROXY_RETRY_DELAY_MS` | `200` | 单次隧道重试的延迟（毫秒） |
+
+日志：`Upstream proxy attempt failed, retrying`（第一次隧道尝试失败）、
+`Upstream proxy retry failed, falling back to direct`（本条请求改为直连继续）；
+启动横幅的 `upstreamProxyFallback` 字段可直接确认生效值。
+
+```bash
+CC_UPSTREAM_PROXY_RETRY_DELAY_MS=0 npm start    # 隧道失败立即重试一次，再决定是否回退直连
+```
+
+> **注意**：代理长时间不可用时，每条隧道请求都要先白付一次失败的隧道尝试加退避延迟，
+> 才轮到直连 —— 这是按请求逐条回退，不是熔断器。
 
 ## 内存与部署
 
