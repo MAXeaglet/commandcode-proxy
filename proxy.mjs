@@ -2140,6 +2140,13 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
   };
 }
 
+function anthropicImageUrl(block) {
+  const source = block.source || {};
+  return source.type === 'base64' && source.data
+    ? `data:${source.media_type || 'image/png'};base64,${source.data}`
+    : source.url || '';
+}
+
 function convertAnthropicToOpenAI(anthropicReq) {
   // 1. Extract system prompt (top-level, not in messages array)
   let systemPrompt = '';
@@ -2219,11 +2226,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
             if (block.cache_control) { part.cache_control = block.cache_control; textHasCache = true; }
             parts.push(part);
           } else if (block.type === 'image') {
-            // Anthropic 图片块：{ type:'image', source:{ type:'base64', media_type, data } } 或 source.url
-            const s = block.source || {};
-            const url = s.type === 'base64' && s.data
-              ? `data:${s.media_type || 'image/png'};base64,${s.data}`
-              : (s.url || '');
+            const url = anthropicImageUrl(block);
             if (url) parts.push({ type: 'image_url', image_url: { url } });
           } else if (block.type === 'tool_result') {
             toolResults.push(block);
@@ -2234,9 +2237,17 @@ function convertAnthropicToOpenAI(anthropicReq) {
         // 暂存，tool_result 优先入队：OpenAI 语义要求 tool 消息紧跟 assistant 的
         // tool_calls，同一条 user 消息里的文本要排在 tool 结果之后
       }
+      const toolImages = [];
       for (const tr of toolResults) {
+        for (const block of Array.isArray(tr.content) ? tr.content : []) {
+          if (block.type !== 'image') continue;
+          const url = anthropicImageUrl(block);
+          if (url && url.length <= MAX_TOOL_IMAGE_URL) {
+            toolImages.push({ type: 'image_url', image_url: { url }, _toolImage: true });
+          }
+        }
         const toolContent = typeof tr.content === 'string' ? tr.content
-          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('\n')
+          : Array.isArray(tr.content) ? tr.content.filter(c => c.type !== 'image').map(c => c.text || '').join('\n')
           : String(tr.content || '');
         // OpenAI 语义里 tool 消息的 name 是可选的；会话恢复等场景下 tool_use_id 可能
         // 找不到对应 assistant tool_use（历史被客户端裁剪），此时不硬塞空 name，
@@ -2245,6 +2256,8 @@ function convertAnthropicToOpenAI(anthropicReq) {
         if (toolNameFromId[tr.tool_use_id]) toolMsg.name = toolNameFromId[tr.tool_use_id];
         openaiMessages.push(toolMsg);
       }
+      // Keep parallel tool results together before forwarding their images.
+      if (toolImages.length) openaiMessages.push({ role: 'user', content: toolImages });
       if (parts.length || textContent) {
         // 单块纯文本仍用字符串（线格不变）；多块 / 带断点 / 含图片时用块数组（CLI 的形态）。
         // 注意：content 为字符串时 parts 为空，必须用 textContent 判空（否则整条消息会丢）
@@ -2253,6 +2266,8 @@ function convertAnthropicToOpenAI(anthropicReq) {
       }
     }
   }
+
+  trimToolImages(openaiMessages);
 
   // 3. Build OpenAI request
   const openaiReq = {
