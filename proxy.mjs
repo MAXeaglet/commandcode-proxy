@@ -3065,23 +3065,36 @@ function trimToolImages(messages) {
     for (const part of m.content) if (part && part._toolImage) refs.push({ m, part });
   }
   if (!refs.length) return;
-  const keep = new Set();
+  // 从最新往回累计，**凑不进预算就停**，而不是跳过它继续去找更老的图。
+  //
+  // 为什么必须是连续后缀（2026-11-13 真机事故的根因修复）：
+  // 旧实现「跳过 + 继续找」能多塞几张零散小图，但保留集会带洞，且洞的位置取决于
+  // 当时的图片大小组合 —— 下一轮来了张更小/更大的图，预算余量一变，之前被丢掉的
+  // 老图就会「复活」，洞随之移动。洞一旦前移，被替换块之后的**整段历史内容都变了**，
+  // 上游按前缀匹配的缓存从该点起全部作废：实测 Codex 长会话 29 万 token 只命中 1.4K，
+  // 单次请求成本贵 43 倍。
+  //
+  // 连续后缀下 cut 点只会随历史增长而单调后移（会话历史只增不减、每张图的字节数固定），
+  // 所以：① 已丢弃的旧图永不复用，历史中段不会被二次改写；② 每次改写都落在靠近末尾的
+  // cut 点上，cut 之前的前缀与上一轮逐字相同，缓存能保住绝大部分。
+  let cut = refs.length;                                 // [cut, refs.length) = 保留区
   let used = 0;
-  for (let i = refs.length - 1; i >= 0; i--) {           // 从最新往回挑，至少保一张
+  for (let i = refs.length - 1; i >= 0; i--) {
     const len = (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
-    if (keep.size === 0 || used + len <= MAX_TOOL_IMAGE_BYTES) { keep.add(i); used += len; }
+    if (cut === refs.length) { cut = i; used = len; continue; }   // 至少保一张，哪怕单张就超预算
+    if (used + len > MAX_TOOL_IMAGE_BYTES) break;
+    cut = i; used += len;
   }
-  if (keep.size === refs.length) return;                 // 没超预算，原样不动
+  if (cut === 0) return;                                 // 全都装得下，原样不动
   let droppedBytes = 0;
-  for (let i = 0; i < refs.length; i++) {
-    if (keep.has(i)) continue;
+  for (let i = 0; i < cut; i++) {
     const idx = refs[i].m.content.indexOf(refs[i].part);
     if (idx === -1) continue;
     droppedBytes += (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
     refs[i].m.content[idx] = { type: 'text', text: '[older tool screenshot omitted: image budget exceeded]' };
   }
   log('warn', 'Tool images trimmed to budget', {
-    total: refs.length, kept: keep.size, dropped: refs.length - keep.size,
+    total: refs.length, kept: refs.length - cut, dropped: cut, cutIndex: cut,
     keptBytes: used, droppedBytes, budgetBytes: MAX_TOOL_IMAGE_BYTES,
   });
 }
